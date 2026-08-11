@@ -1,0 +1,78 @@
+---
+title: 本地测试邮件发送
+description: 用测试用的 SMTP 收件箱在本地开发时接收 brkpt-auth 发出的邮件。
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+本篇介绍如何创建一个测试用的 SMTP 收件箱，并用它在本地开发时接收 brkpt-auth 发出的邮件。
+
+当某个功能需要发送邮件，但你还不想配置真实邮件服务商时，可以用这个方法。
+
+## 创建测试 SMTP 账号
+
+打开 Ethereal，创建一个测试账号：
+
+```text
+https://ethereal.email/create
+```
+
+Ethereal 会给你 SMTP 凭证和一个用于查看已捕获测试邮件的网页收件箱。
+
+<Aside type="caution">
+  Ethereal 生成的凭证只会显示一次，离开页面前请先复制好。
+</Aside>
+
+## 配置 SMTP 变量
+
+把生成的 SMTP 凭证复制到已有的 `.env` 文件中：
+
+```bash title=".env"
+SMTP_HOST="smtp.ethereal.email"
+SMTP_PORT="587"
+SMTP_USER="your-ethereal-username"
+SMTP_PASS="your-ethereal-password"
+SMTP_FROM="no-reply@example.test"
+```
+
+修改 `.env` 后重启 NestJS 服务。
+
+## 发送一封测试邮件
+
+触发某个会发送邮件的 brkpt-auth 功能。
+
+例如，如果你完成了[添加 OTP](../../guides/add-otp/)，可以发送一个 OTP 验证码：
+
+```http
+POST /auth/otp/send
+Content-Type: application/json
+
+{
+  "target": "kevin@example.com",
+  "method": "email"
+}
+```
+
+## 打开收件箱
+
+打开 Ethereal 的消息页面：
+
+```text
+https://ethereal.email/messages
+```
+
+找到捕获到的邮件，复制你需要的验证信息，比如 OTP 验证码或 magic link。
+
+## 故障排查
+
+**收件箱里没有出现邮件。**
+
+确认 SMTP 变量和你创建的 Ethereal 账号一致，然后重启 NestJS 服务，再次触发邮件流程。
+
+**找不到 SMTP 凭证了。**
+
+Ethereal 生成的凭证只显示一次。创建一个新的 Ethereal 账号，并更新你的 `.env` 文件。
+
+**邮件格式不是你想要的样子。**
+
+email 驱动是你项目里的源代码。编辑对应驱动的 `send` 方法即可自定义邮件主题或正文。

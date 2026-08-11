@@ -1,0 +1,73 @@
+---
+title: Events
+description: How independent brkpt-auth features communicate through NestJS's event emitter.
+sidebar:
+  order: 3
+---
+
+brkpt-auth uses event emitters and listeners so independent features can communicate with loose coupling. Each feature can be added or removed without the others needing to know it exists.
+
+This works because of how NestJS's `EventEmitter2` behaves: an emitter can `await` an event and receive every listener's return value, and a listener registered with `{ suppressErrors: false }` propagates its exceptions back to that `await`. If no listener is registered for an event at all, `emitAsync` simply resolves with an empty array and the calling flow continues unaffected. That's what lets a feature like `session` or `blacklist` plug into `core`'s flow only when it's enabled, without `core` needing to know whether it exists.
+
+## Two kinds of events, by namespace
+
+Looking at brkpt-auth's event names, they fall into two groups depending on what the namespace segment identifies.
+
+**Commands**, where the namespace names the module that should act on the event:
+
+- `brkpt-auth.session.revoke` — the `session` module should revoke this session
+- `brkpt-auth.session.revoke-others` — the `session` module should revoke every other session
+- `brkpt-auth.session.validate` — the `session` module should confirm this session is still valid
+- `brkpt-auth.verification.send` — whichever verification module matches should send a proof
+- `brkpt-auth.verification.verify` — whichever verification module matches should check a proof
+
+A command has a clear target and, usually, a single listener. The emitter knows exactly what it's asking for.
+
+**Domain events**, where the namespace names whoever emitted the event:
+
+- `brkpt-auth.core.sign-out`
+- `brkpt-auth.credentials.sign-in`
+- `brkpt-auth.reset-password.reset`
+- `brkpt-auth.session.anomaly`
+- `brkpt-auth.session.manual-revoke`
+
+A domain event is a broadcast: "this happened." The emitter doesn't know or care whether anything is listening. `audit`, for instance, listens to several of these purely to record them, but nothing about the emitting feature depends on that.
+
+## Two kinds of listeners, by flow control
+
+Orthogonal to that, listeners are either blocking or non-blocking, and this determines whether an event can interrupt the calling flow.
+
+A **blocking** listener sets `{ suppressErrors: false }`, and the emitter `await`s the result:
+
+```typescript title="src/brkpt-auth/features/session/session.service.ts"
+@OnEvent('brkpt-auth.session.validate', { suppressErrors: false })
+async handleSessionValidate({ sessionId }: SessionValidateEvent) {
+  const exists = await this.port.exists(sessionId);
+  if (!exists) {
+    throw new UnauthorizedException('Session expired or revoked');
+  }
+}
+```
+
+```typescript title="src/brkpt-auth/features/core/core.service.ts"
+await this.eventEmitter.emitAsync('brkpt-auth.session.validate', {
+  sessionId: payload.sid as string,
+} satisfies SessionValidateEvent);
+```
+
+If the listener throws, the exception surfaces at the `await` and stops the refresh flow right there. If `session` isn't enabled, there's no listener, nothing throws, and the refresh proceeds exactly as it would without the event at all. This is what lets [JWT and sessions](../jwt-and-sessions/) stay optional.
+
+A **non-blocking** listener skips `suppressErrors`, and the emitter fires it with `void` instead of awaiting:
+
+```typescript title="src/brkpt-auth/features/core/core.service.ts"
+void this.eventEmitter.emitAsync('brkpt-auth.session.refresh', {
+  sessionId: payload.sid as string,
+  metadata,
+} satisfies SessionRefreshEvent);
+```
+
+Whatever `session.refresh`'s listener does, such as updating `lastActiveAt` or detecting an IP or user-agent change, has no bearing on the response already being returned to the client, so nothing needs to wait for it.
+
+In practice, every domain event is non-blocking (`void`, no `suppressErrors`), since a broadcast doesn't block anything by nature. Commands go either way depending on whether the caller needs the result: `session.create` and `session.validate` are awaited because the calling flow depends on their outcome, while `session.refresh` is fired with `void` because it doesn't.
+
+Keeping these two dimensions separate (who an event is for, and whether it can block) makes it possible to read any single `emitAsync` call and know what happens if the corresponding feature is disabled.

@@ -1,0 +1,274 @@
+---
+title: Use Drizzle
+description: Replace the in-memory user repository with Drizzle ORM and PostgreSQL.
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This recipe shows using Drizzle instead of the Prisma setup from [Use Prisma](../../guides/use-prisma/). Use this if Drizzle is your ORM of choice.
+
+Only `CoreAdapter` and `CredentialsAdapter` change. Nothing else in `brkpt-auth/` is affected.
+
+## Prerequisites
+
+- A project completed from [Get started](../../guides/get-started/)
+- A PostgreSQL database
+
+## Install Drizzle
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add drizzle-orm pg
+pnpm add -D drizzle-kit @types/pg
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install drizzle-orm pg
+npm install -D drizzle-kit @types/pg
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn add drizzle-orm pg
+yarn add -D drizzle-kit @types/pg
+```
+
+  </TabItem>
+</Tabs>
+
+## Configure the database connection
+
+Add `DATABASE_URL` to your existing `.env` file:
+
+```bash title=".env"
+DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/DB_NAME?schema=public"
+```
+
+## Define the schema
+
+<FileTree>
+- src/
+  - db/
+    - schema.ts
+</FileTree>
+
+```typescript title="src/db/schema.ts"
+import { pgTable, serial, text } from 'drizzle-orm/pg-core';
+
+export const users = pgTable('users', {
+  id: serial('id').primaryKey(),
+  name: text('name').notNull(),
+  email: text('email').notNull().unique(),
+  password: text('password').notNull(),
+});
+
+export type User = typeof users.$inferSelect;
+```
+
+brkpt-auth does not require this exact table shape. Your adapters decide which columns are used for JWT payloads, password validation, and safe user responses.
+
+## Create the Drizzle client
+
+<FileTree>
+- src/
+  - db/
+    - db.module.ts
+</FileTree>
+
+```typescript title="src/db/db.module.ts"
+import { Module } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
+import { Pool } from 'pg';
+
+import * as schema from './schema';
+
+export const DRIZZLE = Symbol('DRIZZLE');
+export type DrizzleDb = NodePgDatabase<typeof schema>;
+
+@Module({
+  imports: [ConfigModule],
+  providers: [
+    {
+      provide: DRIZZLE,
+      inject: [ConfigService],
+      useFactory: (config: ConfigService): DrizzleDb => {
+        const pool = new Pool({
+          connectionString: config.getOrThrow('DATABASE_URL'),
+        });
+        return drizzle(pool, { schema });
+      },
+    },
+  ],
+  exports: [DRIZZLE],
+})
+export class DbModule {}
+```
+
+## Configure `drizzle-kit`
+
+```typescript title="drizzle.config.ts"
+import { defineConfig } from 'drizzle-kit';
+
+export default defineConfig({
+  schema: './src/db/schema.ts',
+  out: './drizzle',
+  dialect: 'postgresql',
+  dbCredentials: {
+    url: process.env.DATABASE_URL!,
+  },
+});
+```
+
+Push the schema to your database:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm drizzle-kit push
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npx drizzle-kit push
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn drizzle-kit push
+```
+
+  </TabItem>
+</Tabs>
+
+<Aside type="tip">
+  `drizzle-kit push` is convenient for local development. For a real migration history, use `drizzle-kit generate` followed by `drizzle-kit migrate` instead.
+</Aside>
+
+## Rewrite `CoreAdapter`
+
+```typescript title="src/brkpt-auth/adapters/core.adapter.ts"
+import { Inject, Injectable } from '@nestjs/common';
+import { eq } from 'drizzle-orm';
+
+import { DRIZZLE, type DrizzleDb } from '../../db/db.module';
+import { type User, users } from '../../db/schema';
+import { CorePort } from '../features/core/core.port';
+import { AuthJwtPayload } from './types';
+
+@Injectable()
+export class CoreAdapter implements CorePort<User> {
+  constructor(@Inject(DRIZZLE) private readonly db: DrizzleDb) {}
+
+  mapUserToJwtPayload(user: User): AuthJwtPayload {
+    return {
+      sub: user.id,
+      email: user.email,
+    };
+  }
+
+  shrinkJwtPayload(payload: AuthJwtPayload): Record<string, unknown> {
+    return {
+      sub: payload.sub,
+    };
+  }
+
+  async findUserByJwtPayload(payload: AuthJwtPayload): Promise<User | null> {
+    const [user] = await this.db
+      .select()
+      .from(users)
+      .where(eq(users.id, payload.sub));
+    return user ?? null;
+  }
+
+  toSafeUser(user: User): Record<string, unknown> {
+    const { password: _password, ...safe } = user;
+    return safe;
+  }
+
+  extractUserIdFromJwtPayload(payload: AuthJwtPayload): number {
+    return payload.sub;
+  }
+}
+```
+
+## Rewrite `CredentialsAdapter`
+
+```typescript title="src/brkpt-auth/adapters/credentials.adapter.ts"
+import { Inject, Injectable } from '@nestjs/common';
+import * as bcrypt from 'bcrypt';
+import { eq } from 'drizzle-orm';
+
+import { DRIZZLE, type DrizzleDb } from '../../db/db.module';
+import { type User, users } from '../../db/schema';
+import { CredentialsPort } from '../features/credentials/credentials.port';
+import { SignInDto } from '../features/credentials/dto/sign-in.dto';
+import { SignUpDto } from '../features/credentials/dto/sign-up.dto';
+
+@Injectable()
+export class CredentialsAdapter implements CredentialsPort<User> {
+  constructor(@Inject(DRIZZLE) private readonly db: DrizzleDb) {}
+
+  async findUserByDto(dto: SignInDto | SignUpDto): Promise<User | null> {
+    const [user] = await this.db
+      .select()
+      .from(users)
+      .where(eq(users.email, dto.email));
+    return user ?? null;
+  }
+
+  validatePassword(user: User, dto: SignInDto): Promise<boolean> {
+    return bcrypt.compare(dto.password, user.password);
+  }
+
+  async createUser(dto: SignUpDto): Promise<User> {
+    const password = await bcrypt.hash(dto.password, 10);
+    const [user] = await this.db
+      .insert(users)
+      .values({ name: dto.name, email: dto.email, password })
+      .returning();
+    return user;
+  }
+
+  extractUserIdFromUser(user: User): number {
+    return user.id;
+  }
+}
+```
+
+## Wire up `DbModule`
+
+Replace the in-memory `UserModule` with `DbModule` in `brkpt-auth.module.ts`:
+
+```diff lang="typescript" title="src/brkpt-auth/brkpt-auth.module.ts"
+-import { UserModule } from '../user/user.module';
++import { DbModule } from '../db/db.module';
+
+@Module({
+-  imports: [UserModule],
++  imports: [DbModule],
+  controllers: [...features.flatMap((f) => f.controllers)],
+  providers: [...features.flatMap((f) => f.providers)],
+})
+export class BrkptAuthModule {
+  // ...
+}
+```
+
+You can now remove the `src/user/` folder created in Get started. It only existed to provide the in-memory repository.
+
+## Run and verify
+
+Start the application and sign up through `/auth/sign-up` as in Get started. The created user is now stored in PostgreSQL through Drizzle, and survives a server restart.

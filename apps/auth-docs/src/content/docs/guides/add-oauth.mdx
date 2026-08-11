@@ -1,0 +1,322 @@
+---
+title: Add OAuth
+description: Add OAuth sign-in with Google and GitHub.
+sidebar:
+  order: 5
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This guide continues from Add blacklist and adds the `oauth` feature.
+
+The `oauth` feature lets users sign in with OAuth providers such as Google and GitHub. Like the other sign-in methods, OAuth sign-in uses the same user model and JWT flow.
+
+This guide uses `email` as the account identifier. If the email already exists, the user signs in. If it does not exist, a new user is created first.
+
+By the end of this guide, your application will support:
+
+- `POST /auth/oauth/google`
+- `POST /auth/oauth/github`
+
+## Prerequisites
+
+- A project completed from [Add blacklist](../add-blacklist/)
+- OAuth client IDs and client secrets from Google and GitHub
+
+<Aside type="note">
+  This guide assumes you already have OAuth applications registered with Google and GitHub. Use each provider's official documentation to create the applications and copy the client IDs and client secrets.
+</Aside>
+
+## Add the OAuth feature
+
+**Add the feature**
+
+Run the CLI command:
+
+```bash
+brkpt auth add oauth --driver google,github
+```
+
+<Aside type="note">
+  In brkpt-auth, an adapter connects a feature to your application, while drivers represent the choices that feature can support. Each feature registers one adapter and can register multiple drivers. In the `oauth` feature, `GoogleOAuthDriver` and `GithubOAuthDriver` contain the verification logic for signing in through Google and GitHub.
+</Aside>
+
+The CLI adds a new `features/oauth/` folder with the selected driver files.
+
+If a driver needs extra dependencies, follow the dependency note shown by the CLI. For example, the Google driver uses `google-auth-library`.
+
+<Aside type="tip">
+  You can also run `brkpt auth add oauth` and select drivers interactively.
+</Aside>
+
+**Configure provider credentials**
+
+Add the provider client IDs and client secrets to your existing `.env` file:
+
+```bash title=".env"
+GOOGLE_CLIENT_ID="your-google-client-id"
+GOOGLE_CLIENT_SECRET="your-google-client-secret"
+GITHUB_CLIENT_ID="your-github-client-id"
+GITHUB_CLIENT_SECRET="your-github-client-secret"
+```
+
+**Configure BrkptAuthModule**
+
+Add the `oauth` options to `BrkptAuthModule.forRootAsync`:
+
+```diff lang="typescript" title="src/app.module.ts"
+ BrkptAuthModule.forRootAsync({
+   imports: [ConfigModule],
+   inject: [ConfigService],
+   useFactory: (config: ConfigService) => ({
+     jwt: {
+       // ...
+     },
++    oauth: {
++      google: {
++        clientId: config.getOrThrow('GOOGLE_CLIENT_ID'),
++        clientSecret: config.getOrThrow('GOOGLE_CLIENT_SECRET'),
++      },
++      github: {
++        clientId: config.getOrThrow('GITHUB_CLIENT_ID'),
++        clientSecret: config.getOrThrow('GITHUB_CLIENT_SECRET'),
++      },
++    },
+   }),
+ }),
+```
+
+**Define and validate the DTO**
+
+The `oauth` feature generates an empty DTO by default. The request body is passed to the driver selected by the `:provider` route parameter.
+
+For this guide, `/auth/oauth/google` uses `GoogleOAuthDriver`, whose `verify` method reads `idToken`. `/auth/oauth/github` uses `GithubOAuthDriver`, whose `verify` method reads `code`.
+
+Add those fields to the DTO:
+
+```diff lang="typescript" title="src/brkpt-auth/features/oauth/dto/oauth.dto.ts"
++import { IsOptional, IsString } from 'class-validator';
+
+export class OAuthDto {
++  @IsOptional()
++  @IsString()
++  idToken?: string;
++
++  @IsOptional()
++  @IsString()
++  code?: string;
+}
+```
+
+The field names must match what the selected driver reads in its `verify` method. Because Google and GitHub share this DTO, both fields are optional here; the selected driver decides which one is required.
+
+**Define the user profile type**
+
+Different providers return different user payloads. Add `UserProfile` to `adapters/types.ts` so the adapter can normalize those payloads before finding or creating a user:
+
+```typescript title="src/brkpt-auth/adapters/types.ts"
+export interface UserProfile {
+  name: string;
+  email: string;
+}
+```
+
+**Implement `OAuthAdapter`**
+
+The OAuth adapter turns provider data into `UserProfile`, then finds or creates a user.
+
+Create `oauth.adapter.ts` and implement the Prisma-backed OAuth adapter:
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - oauth.adapter.ts
+</FileTree>
+
+```typescript title="src/brkpt-auth/adapters/oauth.adapter.ts"
+import { BadRequestException, Injectable } from '@nestjs/common';
+import { TokenPayload } from 'google-auth-library';
+
+import { User } from '../../../generated/prisma/client';
+import { PrismaService } from '../../prisma/prisma.service';
+import { OAuthPort } from '../features/oauth/oauth.port';
+import { UserProfile } from './types';
+
+interface GoogleUser extends TokenPayload {
+  name: string;
+  email: string;
+}
+
+interface GitHubUser {
+  id: number;
+  login: string;
+  name: string | null;
+  email: string | null;
+}
+
+@Injectable()
+export class OAuthAdapter implements OAuthPort<User, UserProfile> {
+  constructor(private readonly prisma: PrismaService) {}
+
+  mapRawToProfile(provider: string, raw: unknown): UserProfile | undefined {
+    switch (provider) {
+      case 'google': {
+        const r = raw as GoogleUser;
+        if (!r.email) {
+          throw new BadRequestException(
+            'Google profile does not include an email address',
+          );
+        }
+        return { name: r.name, email: r.email };
+      }
+      case 'github': {
+        const r = raw as GitHubUser;
+        if (!r.email) {
+          throw new BadRequestException(
+            'GitHub profile does not include an email address',
+          );
+        }
+        return { name: r.name ?? r.login, email: r.email ?? '' };
+      }
+    }
+  }
+
+  async findOrCreateUserByProfile(
+    profile: UserProfile,
+  ): Promise<{ user: User; created: boolean }> {
+    const existing = await this.prisma.user.findUnique({
+      where: { email: profile.email },
+    });
+    if (existing) {
+      return { user: existing, created: false };
+    }
+
+    const user = await this.prisma.user.create({
+      data: {
+        name: profile.name,
+        email: profile.email,
+        password: '',
+      },
+    });
+
+    return { user, created: true };
+  }
+
+  extractUserIdFromUser(user: User): number {
+    return user.id;
+  }
+}
+```
+
+This guide continues the same account model from the previous guides: `email` identifies the user. The OAuth adapter uses that email to sign in an existing user or create a new one. You can change this matching logic for your own application.
+
+<Aside type="note">
+  OAuth-created users store an empty password in this guide. This does not make empty-password sign-in possible: credentials sign-in still verifies the submitted password with `bcrypt.compare`, and an empty stored value is not the bcrypt hash of an empty password. Later features can let these users set or reset a password, so they can also sign in with email and password.
+</Aside>
+
+<Aside type="tip">
+  In production, you may choose to represent passwordless accounts with a nullable password field instead of an empty string. The adapter controls how password storage is handled.
+</Aside>
+
+<Aside type="note">
+  This guide requires an email address because `email` is used as the account identifier. If a provider payload does not include an email, the adapter rejects the sign-in request instead of creating a user with incomplete data.
+</Aside>
+
+**Register the feature**
+
+Update `features.ts` and pass `OAuthAdapter` and the driver classes to `oauthFeature`:
+
+```typescript title="src/brkpt-auth/features.ts" ins="OAuthAdapter" ins="GoogleOAuthDriver" ins="GithubOAuthDriver"
+import { BlacklistAdapter } from './adapters/blacklist.adapter';
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { OAuthAdapter } from './adapters/oauth.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { blacklistFeature } from './features/blacklist/blacklist.feature';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { GoogleOAuthDriver } from './features/oauth/drivers/google.driver';
+import { GithubOAuthDriver } from './features/oauth/drivers/github.driver';
+import { oauthFeature } from './features/oauth/oauth.feature';
+import { sessionFeature } from './features/session/session.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  blacklistFeature(BlacklistAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+  oauthFeature(OAuthAdapter, GoogleOAuthDriver, GithubOAuthDriver),
+];
+```
+
+Only drivers passed to `oauthFeature` are enabled. You can keep a driver file in the project without enabling it here.
+
+## Run and verify
+
+Start the application:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+The `oauth` feature adds one provider-based endpoint:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/auth/oauth/:provider` | Sign in with an OAuth provider |
+
+The `:provider` value must match an enabled driver, such as `google` or `github`.
+
+**Google**
+
+Get a Google `idToken` from your frontend or a temporary test flow, then send it to the server:
+
+```http
+POST /auth/oauth/google
+Content-Type: application/json
+
+{
+  "idToken": "<google-id-token>"
+}
+```
+
+**GitHub**
+
+Get a GitHub authorization `code` from your frontend or a temporary test flow, then send it to the server:
+
+```http
+POST /auth/oauth/github
+Content-Type: application/json
+
+{
+  "code": "<github-code>"
+}
+```
+
+If the email already exists, the request signs in that user. If it does not exist, a new user is created first. Both cases return the same token result as the other sign-in methods.
+
+<Aside type="note">
+  Without a frontend, you need to obtain a real Google `idToken` or GitHub `code` before calling these endpoints. See [Test Google OAuth locally](../../recipes/test-google-oauth-locally/) and [Test GitHub OAuth locally](../../recipes/test-github-oauth-locally/) for local testing flows.
+</Aside>

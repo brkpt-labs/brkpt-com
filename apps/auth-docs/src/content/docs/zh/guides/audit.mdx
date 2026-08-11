@@ -1,0 +1,286 @@
+---
+title: 审计
+description: 记录已启用的 brkpt-auth 功能中重要的身份验证和账户事件。
+sidebar:
+  order: 11
+---
+
+import { FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+本指南添加 `audit` 功能。
+
+其他 brkpt-auth 功能会为重要的身份验证和账户操作发出事件。`audit` 功能监听这些事件，并把它们传给你的适配器，你可以在其中记录、存储或处理它们用于审计。
+
+## 添加 audit 功能
+
+**添加功能**
+
+运行 CLI 命令：
+
+```bash
+brkpt auth add audit
+```
+
+CLI 会添加一个新的 `features/audit/` 文件夹。
+
+**实现适配器**
+
+创建一个适配器，处理已启用功能发出的审计事件：
+
+<FileTree>
+
+- src/
+  - brkpt-auth/
+    - adapters/
+      - audit.adapter.ts
+
+</FileTree>
+
+下面的示例把结构化的审计记录写入控制台。在实际应用中，适配器可以把它们发送到数据库、日志服务或其他审计目的地。
+
+```typescript title="src/brkpt-auth/adapters/audit.adapter.ts"
+import { Injectable } from '@nestjs/common';
+
+import {
+  ChangePasswordEvent,
+  ResetPasswordEvent,
+  SessionAnomalyEvent,
+  SessionManualRevokeEvent,
+  SessionManualRevokeOthersEvent,
+  SignInEvent,
+  SignOutEvent,
+  SignUpEvent,
+  UserDeleteEvent,
+  VerifyEmailEvent,
+} from '../common/interfaces';
+import { AuditPort } from '../features/audit/audit.port';
+
+@Injectable()
+export class AuditAdapter implements AuditPort {
+  private log(event: string, fields: Record<string, unknown>) {
+    console.log(
+      JSON.stringify({
+        logger: 'brkpt-auth:audit',
+        event,
+        ...fields,
+      }),
+    );
+  }
+
+  handleSignUp({
+    userId,
+    feature,
+    timestamp,
+    metadata,
+  }: SignUpEvent): Promise<void> | void {
+    this.log('sign_up', {
+      userId: String(userId),
+      feature,
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleSignIn({ userId, feature, timestamp, metadata }: SignInEvent) {
+    this.log('sign_in', {
+      userId: String(userId),
+      feature,
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleSignOut({ userId, timestamp, metadata }: SignOutEvent) {
+    this.log('sign_out', {
+      userId: String(userId),
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleVerifyEmail({ userId, timestamp, metadata }: VerifyEmailEvent) {
+    this.log('verify_email', {
+      userId: String(userId),
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleChangePassword({ userId, timestamp, metadata }: ChangePasswordEvent) {
+    this.log('change_password', {
+      userId: String(userId),
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleResetPassword({ userId, timestamp, metadata }: ResetPasswordEvent) {
+    this.log('reset_password', {
+      userId: String(userId),
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleSessionAnomaly({
+    sessionId,
+    userId,
+    type,
+    previous,
+    current,
+  }: SessionAnomalyEvent) {
+    this.log('session_anomaly', {
+      sessionId,
+      userId: String(userId),
+      type,
+      message: `${type}: ${previous} → ${current}`,
+    });
+  }
+
+  handleSessionManualRevoke({
+    sessionId,
+    userId,
+    timestamp,
+    metadata,
+  }: SessionManualRevokeEvent) {
+    this.log('session_manual_revoke', {
+      sessionId,
+      userId: String(userId),
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleSessionManualRevokeOthers({
+    userId,
+    timestamp,
+    metadata,
+  }: SessionManualRevokeOthersEvent) {
+    this.log('session_manual_revoke_others', {
+      userId: String(userId),
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleUserDelete({ userId, timestamp, metadata }: UserDeleteEvent) {
+    this.log('user_delete', {
+      userId: String(userId),
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+}
+```
+
+**注册功能**
+
+更新 `features.ts`，把 `AuditAdapter` 传给 `auditFeature`：
+
+```typescript title="src/brkpt-auth/features.ts" ins="AuditAdapter"
+import { AuditAdapter } from './adapters/audit.adapter';
+import { BlacklistAdapter } from './adapters/blacklist.adapter';
+import { ChangePasswordAdapter } from './adapters/change-password.adapter';
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { MagicLinkAdapter } from './adapters/magic-link.adapter';
+import { OAuthAdapter } from './adapters/oauth.adapter';
+import { OtpAdapter } from './adapters/otp.adapter';
+import { ResetPasswordAdapter } from './adapters/reset-password.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { VerifyEmailAdapter } from './adapters/verify-email.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { auditFeature } from './features/audit/audit.feature';
+import { blacklistFeature } from './features/blacklist/blacklist.feature';
+import { changePasswordFeature } from './features/change-password/change-password.feature';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { EmailMagicLinkDriver } from './features/magic-link/drivers/email.driver';
+import { magicLinkFeature } from './features/magic-link/magic-link.feature';
+import { GithubOAuthDriver } from './features/oauth/drivers/github.driver';
+import { GoogleOAuthDriver } from './features/oauth/drivers/google.driver';
+import { oauthFeature } from './features/oauth/oauth.feature';
+import { EmailOtpDriver } from './features/otp/drivers/email.driver';
+import { otpFeature } from './features/otp/otp.feature';
+import { resetPasswordFeature } from './features/reset-password/reset-password.feature';
+import { sessionFeature } from './features/session/session.feature';
+import { verifyEmailFeature } from './features/verify-email/verify-email.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  blacklistFeature(BlacklistAdapter),
+  verifyEmailFeature(VerifyEmailAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+  oauthFeature(OAuthAdapter, GoogleOAuthDriver, GithubOAuthDriver),
+  otpFeature(OtpAdapter, EmailOtpDriver),
+  magicLinkFeature(MagicLinkAdapter, EmailMagicLinkDriver),
+  changePasswordFeature(ChangePasswordAdapter),
+  resetPasswordFeature(ResetPasswordAdapter),
+  auditFeature(AuditAdapter),
+];
+```
+
+## 运行并验证
+
+启动应用：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+`audit` 功能不会新增任何端点，它只是记录其他已启用功能产生的、受支持的事件。
+
+**记录一条审计事件**
+
+用 credentials 登录：
+
+```http
+POST /auth/sign-in
+Content-Type: application/json
+
+{
+  "email": "kevin@example.com",
+  "password": "password"
+}
+```
+
+登录成功后，适配器会写入一条类似这样的审计记录：
+
+```json
+{
+  "logger": "brkpt-auth:audit",
+  "event": "sign_in",
+  "userId": "1",
+  "feature": "credentials",
+  "timestamp": "2026-08-09T12:34:56.789Z",
+  "metadata": {
+    "userAgent": "example-client/1.0",
+    "ip": "127.0.0.1"
+  }
+}
+```
+
+其他受支持的操作，包括注册、登出、邮箱验证、修改密码、会话管理和删除用户，都会以同样的方式传给适配器。

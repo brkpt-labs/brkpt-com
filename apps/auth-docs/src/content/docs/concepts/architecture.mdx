@@ -1,0 +1,260 @@
+---
+title: Architecture
+description: How BrkptAuthModule composes features, ports, and adapters into your NestJS application.
+sidebar:
+  order: 1
+---
+
+import { Aside, FileTree } from '@astrojs/starlight/components';
+
+brkpt-auth is built around a single `BrkptAuthModule`, registered once in your `AppModule`. Its controllers, guards, and services are assembled from a list of enabled features.
+
+## Features and their registration function
+
+Each feature exports a registration function, typically named `<name>Feature`, defined in its own `*.feature.ts` file. The function takes an adapter (and, for some features, one or more drivers) and returns a `FeatureConfig`: the controllers and providers NestJS needs to wire up that feature.
+
+```typescript title="src/brkpt-auth/features/credentials/credentials.feature.ts"
+import { Type } from '@nestjs/common';
+
+import { FeatureConfig, PortProvider } from '../../common/interfaces';
+import { CredentialsController } from './credentials.controller';
+import {
+  BRKPT_AUTH_CREDENTIALS_PORT,
+  CredentialsPort,
+} from './credentials.port';
+import { CredentialsService } from './credentials.service';
+
+export const credentialsFeature = (
+  adapter: Type<CredentialsPort>,
+): FeatureConfig => ({
+  controllers: [CredentialsController],
+  providers: [
+    {
+      provide: BRKPT_AUTH_CREDENTIALS_PORT,
+      useClass: adapter,
+    } satisfies PortProvider<CredentialsPort>,
+    CredentialsService,
+  ],
+});
+```
+
+The `adapter` parameter is typed against the feature's port, so `credentialsFeature` only accepts a class that implements `CredentialsPort`:
+
+```typescript title="src/brkpt-auth/features/credentials/credentials.port.ts"
+export const BRKPT_AUTH_CREDENTIALS_PORT = Symbol(
+  'BRKPT_AUTH_CREDENTIALS_PORT',
+);
+
+export interface CredentialsPort<TUser = unknown> {
+  findUserByDto(dto: unknown): Promise<TUser | null>;
+  validatePassword(user: TUser, dto: unknown): Promise<boolean>;
+  createUser(dto: unknown): Promise<TUser>;
+  extractUserIdFromUser(user: TUser): unknown;
+}
+```
+
+The port defines the contract only. brkpt-auth implements the business logic in `CredentialsService`; the adapter decides how users are looked up, validated, and created. Most adapter methods are simple field mappings or a direct call into an existing user service, as shown in [Get started](../../guides/get-started/).
+
+<Aside type="tip">
+  brkpt-auth doesn't require adapters to live in any particular folder. Placing them under `src/brkpt-auth/adapters/` is a convention used throughout these docs to keep them visually separate from the files brkpt-auth installs, not a requirement.
+</Aside>
+
+## Registering features
+
+You list every enabled feature, together with its adapter (and drivers, if any), in `features.ts`:
+
+```typescript title="src/brkpt-auth/features.ts"
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { sessionFeature } from './features/session/session.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+  // ...one entry per enabled feature
+];
+```
+
+`BrkptAuthModule` flattens every feature's controllers and providers into itself:
+
+```typescript title="src/brkpt-auth/brkpt-auth.module.ts"
+import { DynamicModule, Module } from '@nestjs/common';
+import { JwtModule } from '@nestjs/jwt';
+
+import { BRKPT_AUTH_MODULE_OPTIONS } from './common/constants';
+import {
+  BrkptAuthModuleAsyncOptions,
+  BrkptAuthModuleOptions,
+} from './common/interfaces';
+import { features } from './features';
+
+@Module({
+  controllers: [...features.flatMap((f) => f.controllers)],
+  providers: [...features.flatMap((f) => f.providers)],
+})
+export class BrkptAuthModule {
+  static forRoot(options: BrkptAuthModuleOptions): DynamicModule {
+    return {
+      module: BrkptAuthModule,
+      imports: [
+        JwtModule.register({
+          global: true,
+          secret: options.jwt.access.secret,
+          signOptions: {
+            expiresIn: options.jwt.access.expiresIn,
+          },
+        }),
+      ],
+      providers: [
+        {
+          provide: BRKPT_AUTH_MODULE_OPTIONS,
+          useValue: options,
+        },
+      ],
+    };
+  }
+
+  static forRootAsync(options: BrkptAuthModuleAsyncOptions): DynamicModule {
+    return {
+      module: BrkptAuthModule,
+      imports: [
+        ...(options.imports || []),
+        JwtModule.registerAsync({
+          global: true,
+          imports: options.imports || [],
+          inject: options.inject || [],
+          useFactory: async (...args: any) => {
+            const config = await options.useFactory.apply(null, args);
+            return {
+              secret: config.jwt.access.secret,
+              signOptions: {
+                expiresIn: config.jwt.access.expiresIn,
+              },
+            };
+          },
+        }),
+      ],
+      providers: [
+        ...(options.providers || []),
+        {
+          provide: BRKPT_AUTH_MODULE_OPTIONS,
+          useFactory: options.useFactory,
+          inject: options.inject,
+        },
+      ],
+    };
+  }
+}
+```
+
+Most of the time, you don't edit `BrkptAuthModule` by hand: running `brkpt auth add <feature>` updates `features.ts` for you, described below. You still edit `BrkptAuthModule` directly when a feature's adapter needs an extra import (a database module, for example) or a provider that isn't registered through `features.ts`.
+
+## Directory anatomy
+
+A typical `src/brkpt-auth/` folder looks like this once several features are enabled:
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - core.adapter.ts
+      - credentials.adapter.ts
+      - session.adapter.ts
+      - ...
+    - common/
+      - constants/
+      - decorators/
+      - interfaces/
+      - utils/
+    - features/
+      - core/
+        - guards/
+          - jwt.guard.ts
+          - jwt-refresh.guard.ts
+        - core.controller.ts
+        - core.feature.ts
+        - core.port.ts
+        - core.service.ts
+        - core.service.spec.ts
+      - credentials/
+        - dto/
+          - sign-in.dto.ts
+          - sign-up.dto.ts
+        - credentials.controller.ts
+        - credentials.feature.ts
+        - credentials.port.ts
+        - credentials.service.ts
+        - credentials.service.spec.ts
+      - oauth/
+        - drivers/
+        - dto/
+        - ...
+      - otp/
+      - magic-link/
+      - session/
+      - blacklist/
+      - verify-email/
+      - change-password/
+      - reset-password/
+      - audit/
+    - brkpt-auth.module.ts
+    - features.ts
+</FileTree>
+
+From the top:
+
+- **`adapters/`** holds the adapters you write. As noted above, this location is a convention, not a requirement.
+- **`common/`** holds constants, decorators, shared interfaces, and utility functions used across every feature. It's pulled in during `brkpt auth init` and doesn't change per feature.
+- **`features/`** holds one folder per feature. Every feature folder contains at least:
+  - `*.service.ts` — the feature's business logic
+  - `*.service.spec.ts` — unit tests for that logic
+  - `*.port.ts` — the interface your adapter implements
+  - `*.feature.ts` — the registration function described above
+
+  Depending on the feature, it may also contain:
+  - `*.controller.ts` — the HTTP routes
+  - `dto/` — request DTOs for those routes. Some are generated empty, since brkpt-auth doesn't assume which fields your sign-up or sign-in requests use; others have a fixed shape because the route itself is fixed (as with OTP or magic link)
+  - `*.driver.ts` — the driver contract for that feature, if it supports multiple interchangeable implementations
+  - `drivers/` — the concrete drivers brkpt-auth ships (for example, the Google and GitHub OAuth drivers)
+  - `*.guard.ts` — a guard, registered globally by the feature's registration function
+
+A feature's driver contract typically looks like this:
+
+```typescript title="src/brkpt-auth/features/oauth/oauth.driver.ts"
+import { Type } from '@nestjs/common';
+
+export const BRKPT_AUTH_OAUTH_DRIVER_MAP = Symbol(
+  'BRKPT_AUTH_OAUTH_DRIVER_MAP',
+);
+
+export interface OAuthDriver {
+  readonly provider: string;
+  verify(dto: unknown): Promise<unknown>;
+}
+
+export const oauthDriverMapProvider = (
+  ...driverClasses: Type<OAuthDriver>[]
+) => ({
+  provide: BRKPT_AUTH_OAUTH_DRIVER_MAP,
+  useFactory: (...drivers: OAuthDriver[]): Map<string, OAuthDriver> =>
+    new Map(drivers.map((d) => [d.provider, d])),
+  inject: driverClasses,
+});
+```
+
+An adapter connects a feature to your application; drivers represent interchangeable choices within that feature. `oauthFeature` registers one adapter and any number of drivers, and the same pattern is used by `otp` and `magic-link`.
+
+At the root, **`brkpt-auth.module.ts`** is the module itself, and **`features.ts`** is the list you edit to enable or disable features.
+
+## Portability
+
+All of an application's auth code lives inside `brkpt-auth/`. Because business logic sits behind a port, implementation details stay in the adapter: a feature's service never depends on how users are stored, what the JWT payload looks like, or which database is in use. Moving to a different project means copying `brkpt-auth/` and rewriting the adapters.
+
+## CLI automation
+
+The `@brkpt/cli` handles the mechanical parts of this workflow. `brkpt auth init` fetches the `core` feature and the shared `common/` files from the brkpt-auth repository. `brkpt auth add <feature>` fetches a specific feature's files, adds an entry for it to `features.ts` (without an adapter argument; you still need to write and pass that yourself), and reorders the `features.ts` array so globally registered guards end up in the correct order.

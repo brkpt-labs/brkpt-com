@@ -1,0 +1,350 @@
+---
+title: Add sessions
+description: Add session management for refresh tokens with Redis.
+sidebar:
+  order: 3
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This guide continues from Use Prisma and adds the `session` feature.
+
+Access tokens remain short-lived and stateless. The `session` feature adds server-side state for refresh tokens, so a refresh token can be rejected when its session is revoked.
+
+This guide uses Redis for session storage because it supports TTL-based keys and sorted sets for per-user session indexes.
+
+By the end of this guide, your application will be able to list active sessions, revoke a specific session, revoke other sessions, and reject refresh requests from revoked sessions.
+
+<Aside type="note">
+  Session management adds one lightweight Redis lookup during refresh. Regular access-token protected requests remain stateless.
+</Aside>
+
+## Prerequisites
+
+- A project completed from [Use Prisma](../use-prisma/)
+- A running Redis instance
+
+## Install Redis client
+
+Install the Redis client used in this guide:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add redis
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install redis
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn add redis
+```
+
+  </TabItem>
+</Tabs>
+
+## Configure the Redis connection
+
+Add Redis connection settings to your existing `.env` file:
+
+```bash title=".env"
+REDIS_HOST=localhost
+REDIS_PORT=6379
+```
+
+## Create RedisModule
+
+Create a small Redis module that provides a connected Redis client:
+
+<FileTree>
+- src/
+  - redis/
+    - redis.module.ts
+</FileTree>
+
+```typescript title="src/redis/redis.module.ts"
+import { Module } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { createClient } from 'redis';
+
+@Module({
+  imports: [ConfigModule],
+  providers: [
+    {
+      provide: 'REDIS_CLIENT',
+      inject: [ConfigService],
+      async useFactory(config: ConfigService) {
+        const client = createClient({
+          socket: {
+            host: config.getOrThrow('REDIS_HOST'),
+            port: Number(config.getOrThrow('REDIS_PORT')),
+          },
+        });
+        await client.connect();
+        return client;
+      },
+    },
+  ],
+  exports: ['REDIS_CLIENT'],
+})
+export class RedisModule {}
+```
+
+## Add the session feature
+
+**Add the feature**
+
+Run the CLI command:
+
+```bash
+brkpt auth add session
+```
+
+The CLI adds a new `features/session/` folder.
+
+**Implement `SessionAdapter`**
+
+The session adapter has more methods than the previous adapters, but most of them are small Redis operations.
+
+They fall into two groups:
+
+- **Session storage**: create, read, update, and delete a session.
+- **User index**: keep a per-user session list for listing and batch revocation.
+
+The implementation below is enough to get started with Redis.
+
+Create `session.adapter.ts`:
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - session.adapter.ts
+</FileTree>
+
+```typescript title="src/brkpt-auth/adapters/session.adapter.ts"
+import { Inject, Injectable } from '@nestjs/common';
+import { type RedisClientType } from 'redis';
+
+import { SessionData } from '../common/interfaces';
+import { SessionPort } from '../features/session/session.port';
+import { AuthJwtPayload } from './types';
+
+@Injectable()
+export class SessionAdapter implements SessionPort {
+  constructor(
+    @Inject('REDIS_CLIENT') private readonly redis: RedisClientType,
+  ) {}
+
+  private key(sessionId: string) {
+    return `session:${sessionId}`;
+  }
+
+  private userIndexKey(userId: unknown) {
+    return `session:user:${String(userId)}`;
+  }
+
+  async create(
+    sessionId: string,
+    data: SessionData,
+    ttlMs: number,
+  ): Promise<void> {
+    await this.redis.set(this.key(sessionId), JSON.stringify(data), {
+      expiration: { type: 'PX', value: ttlMs },
+    });
+  }
+
+  async exists(sessionId: string): Promise<boolean> {
+    return !!(await this.redis.exists(this.key(sessionId)));
+  }
+
+  async findById(sessionId: string): Promise<SessionData | null> {
+    const data = await this.redis.get(this.key(sessionId));
+    return data ? (JSON.parse(data) as SessionData) : null;
+  }
+
+  async update(sessionId: string, data: SessionData): Promise<void> {
+    const key = this.key(sessionId);
+    const ttlMs = await this.redis.pTTL(key);
+    if (ttlMs > 0) {
+      await this.redis.set(key, JSON.stringify(data), {
+        expiration: { type: 'PX', value: ttlMs },
+      });
+    }
+  }
+
+  async delete(sessionId: string): Promise<void> {
+    await this.redis.del(this.key(sessionId));
+  }
+
+  async addToUserIndex(
+    userId: unknown,
+    sessionId: string,
+    expiresAt: number,
+  ): Promise<void> {
+    await this.redis.zAdd(this.userIndexKey(userId), {
+      score: expiresAt,
+      value: sessionId,
+    });
+  }
+
+  async removeFromUserIndex(userId: unknown, sessionId: string): Promise<void> {
+    await this.redis.zRem(this.userIndexKey(userId), sessionId);
+  }
+
+  async pruneUserIndex(userId: unknown, before: number): Promise<void> {
+    await this.redis.zRemRangeByScore(
+      this.userIndexKey(userId),
+      '-inf',
+      before,
+    );
+  }
+
+  getUserIndexSessionIds(userId: unknown): Promise<string[]> {
+    return this.redis.zRange(this.userIndexKey(userId), 0, -1);
+  }
+
+  extractUserIdFromJwtPayload(payload: AuthJwtPayload): number {
+    return payload.sub;
+  }
+}
+```
+
+<Aside type="note">
+  Session data is stored as JSON at `session:{sessionId}`. User session indexes are stored as Redis sorted sets at `session:user:{userId}`, using the expiration timestamp as the score.
+</Aside>
+
+**Register the feature**
+
+Update `features.ts` and pass `SessionAdapter` to `sessionFeature`:
+
+```typescript title="src/brkpt-auth/features.ts" ins="SessionAdapter"
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { sessionFeature } from './features/session/session.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+];
+```
+
+**Import `RedisModule`**
+
+`SessionAdapter` depends on `REDIS_CLIENT`, which is exported by `RedisModule`.
+
+Add `RedisModule` to `brkpt-auth.module.ts`:
+
+```diff lang="typescript" title="src/brkpt-auth/brkpt-auth.module.ts"
+import { PrismaModule } from '../prisma/prisma.module';
++import { RedisModule } from '../redis/redis.module';
+
+@Module({
+-  imports: [PrismaModule],
++  imports: [PrismaModule, RedisModule],
+  controllers: [...features.flatMap((f) => f.controllers)],
+  providers: [...features.flatMap((f) => f.providers)],
+})
+export class BrkptAuthModule {
+  // ...
+}
+```
+
+<Aside type="note">
+  Some NestJS projects register `RedisModule` globally. This guide imports `RedisModule` directly in `BrkptAuthModule` to keep the adapter dependency explicit. If your application already provides `REDIS_CLIENT` globally, you do not need to add `RedisModule` here.
+</Aside>
+
+<Aside type="tip">
+  To disable the `session` feature, remove `sessionFeature(SessionAdapter)` from `features.ts`.
+</Aside>
+
+## Run and verify
+
+Start the application:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+The `session` feature adds the following endpoints:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/auth/session` | List the current user's active sessions |
+| `DELETE` | `/auth/session/:sessionId` | Revoke a specific session |
+| `DELETE` | `/auth/session/others` | Revoke all sessions except the current one |
+
+Use an existing account from Get started, or create a new one with `/auth/sign-up`.
+
+**List sessions**
+
+Sign in multiple times with the same account. Each successful sign-in creates a new session.
+
+Then list the active sessions:
+
+```http
+GET /auth/session
+Authorization: Bearer <access-token>
+```
+
+The response should include the active sessions for the current user.
+
+**Revoke a session**
+
+Revoke one session by id:
+
+```http
+DELETE /auth/session/<session-id>
+Authorization: Bearer <access-token>
+```
+
+After a session is revoked, the refresh token associated with that session can no longer be used to call `/auth/refresh`.
+
+**Revoke other sessions**
+
+Revoke all sessions except the current one:
+
+```http
+DELETE /auth/session/others
+Authorization: Bearer <access-token>
+```
+
+This is useful for "sign out from other devices" flows.
+
+<Aside type="note">
+  Revoking a session invalidates the refresh token for that session. Existing access tokens remain valid until they expire. To revoke access tokens immediately, continue to [Add blacklist](../add-blacklist/).
+</Aside>

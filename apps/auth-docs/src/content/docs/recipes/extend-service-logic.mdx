@@ -1,0 +1,115 @@
+---
+title: Extend service logic
+description: When a port isn't enough, edit the installed source directly.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Most customization in brkpt-auth happens through your adapter: a different way to look up, validate, or store a user. Sometimes what you need isn't a different way to map data, but a change to the flow itself. Because a feature's `*.service.ts` is source code installed directly into your project, not a compiled package, editing it directly is a supported way to make that change.
+
+This recipe adds a failed sign-in attempt lockout to `credentials`, something no combination of adapter methods can express, since it changes when `validatePassword` is even called.
+
+## Prerequisites
+
+- A project completed from [Get started](../../guides/get-started/)
+- A running Redis instance, or another store you can hold short-lived counters in
+
+## Locate the method
+
+Open `src/brkpt-auth/features/credentials/credentials.service.ts`. `signIn` looks like this:
+
+```typescript title="src/brkpt-auth/features/credentials/credentials.service.ts"
+async signIn(dto: unknown, metadata?: RequestMetadata) {
+  const user = await this.port.findUserByDto(dto);
+  if (!user) {
+    throw new UnauthorizedException('Invalid credentials');
+  }
+
+  const isValid = await this.port.validatePassword(user, dto);
+  if (!isValid) {
+    throw new UnauthorizedException('Invalid credentials');
+  }
+
+  void this.eventEmitter.emitAsync('brkpt-auth.credentials.sign-in', {
+    userId: this.port.extractUserIdFromUser(user),
+    feature: 'credentials',
+    timestamp: Date.now(),
+    metadata,
+  } satisfies SignInEvent);
+
+  return this.coreService.generateTokens(user, metadata);
+}
+```
+
+`Inject` and `UnauthorizedException` are already imported at the top of the file (the constructor already uses `@Inject(BRKPT_AUTH_CREDENTIALS_PORT)`), so the lockout only needs one new import.
+
+## Add the lockout
+
+Inject a store for the attempt counter, and check it before validating the password:
+
+```diff lang="typescript" title="src/brkpt-auth/features/credentials/credentials.service.ts"
++import { type RedisClientType } from 'redis';
+
+ @Injectable()
+ export class CredentialsService {
+   constructor(
+     @Inject(BRKPT_AUTH_CREDENTIALS_PORT)
+     private readonly port: CredentialsPort,
+     private readonly coreService: CoreService,
+     private readonly eventEmitter: EventEmitter2,
++    @Inject('REDIS_CLIENT')
++    private readonly redis: RedisClientType,
+   ) {}
+
++  private readonly maxAttempts = 5;
++  private readonly lockoutSeconds = 15 * 60;
+
+   async signIn(dto: unknown, metadata?: RequestMetadata) {
+     const user = await this.port.findUserByDto(dto);
+     if (!user) {
+       throw new UnauthorizedException('Invalid credentials');
+     }
+
++    const userId = this.port.extractUserIdFromUser(user);
++    const key = `login-attempts:${userId}`;
++    const attempts = Number((await this.redis.get(key)) ?? 0);
++    if (attempts >= this.maxAttempts) {
++      throw new UnauthorizedException(
++        'Too many failed attempts. Try again later.',
++      );
++    }
+
+     const isValid = await this.port.validatePassword(user, dto);
+     if (!isValid) {
++      await this.redis
++        .multi()
++        .incr(key)
++        .expire(key, this.lockoutSeconds)
++        .exec();
+       throw new UnauthorizedException('Invalid credentials');
+     }
+
++    await this.redis.del(key);
+
+     void this.eventEmitter.emitAsync('brkpt-auth.credentials.sign-in', {
+-      userId: this.port.extractUserIdFromUser(user),
++      userId,
+       feature: 'credentials',
+       timestamp: Date.now(),
+       metadata,
+     } satisfies SignInEvent);
+
+     return this.coreService.generateTokens(user, metadata);
+   }
+ }
+```
+
+The counter increments on every failed password check and resets on success, with the key itself expiring after `lockoutSeconds` so a lockout clears on its own. `credentials.service.spec.ts`, also installed in your project, is a normal place to add a test for this.
+
+## Why this belongs in the service, not the adapter
+
+`CredentialsPort` only defines how to look up a user, validate a password, create a user, and extract an id: data operations with no opinion about control flow. A lockout needs to run *before* `validatePassword` is called at all, and needs its own state (the attempt counter) that isn't part of the user model. Neither fits a port method signature. Since `credentials.service.ts` isn't a dependency pulled from a package, there's no abstraction to work around. You edit the flow directly, the same way you'd edit any other file you own.
+
+<Aside type="note">
+  Because the CLI can overwrite installed files when you run `brkpt auth add` again for the same feature, keep a note of edits like this one (a comment, a changelog entry, or just committing them separately) so they're easy to reapply if you ever regenerate the feature.
+</Aside>

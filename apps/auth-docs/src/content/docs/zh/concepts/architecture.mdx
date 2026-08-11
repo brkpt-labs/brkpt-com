@@ -1,0 +1,260 @@
+---
+title: 架构
+description: BrkptAuthModule 如何把功能、端口和适配器组合进你的 NestJS 应用。
+sidebar:
+  order: 1
+---
+
+import { Aside, FileTree } from '@astrojs/starlight/components';
+
+brkpt-auth 围绕一个单一的 `BrkptAuthModule` 构建，在你的 `AppModule` 中注册一次。它的控制器、守卫和服务都是从一份已启用功能的列表中组装出来的。
+
+## 功能及其注册函数
+
+每个功能都会导出一个注册函数，通常命名为 `<name>Feature`，定义在各自的 `*.feature.ts` 文件里。这个函数接收一个适配器（部分功能还需要一个或多个驱动），返回一个 `FeatureConfig`：也就是 NestJS 组装该功能所需的控制器和提供者。
+
+```typescript title="src/brkpt-auth/features/credentials/credentials.feature.ts"
+import { Type } from '@nestjs/common';
+
+import { FeatureConfig, PortProvider } from '../../common/interfaces';
+import { CredentialsController } from './credentials.controller';
+import {
+  BRKPT_AUTH_CREDENTIALS_PORT,
+  CredentialsPort,
+} from './credentials.port';
+import { CredentialsService } from './credentials.service';
+
+export const credentialsFeature = (
+  adapter: Type<CredentialsPort>,
+): FeatureConfig => ({
+  controllers: [CredentialsController],
+  providers: [
+    {
+      provide: BRKPT_AUTH_CREDENTIALS_PORT,
+      useClass: adapter,
+    } satisfies PortProvider<CredentialsPort>,
+    CredentialsService,
+  ],
+});
+```
+
+`adapter` 参数的类型绑定到该功能的端口，因此 `credentialsFeature` 只接受实现了 `CredentialsPort` 的类：
+
+```typescript title="src/brkpt-auth/features/credentials/credentials.port.ts"
+export const BRKPT_AUTH_CREDENTIALS_PORT = Symbol(
+  'BRKPT_AUTH_CREDENTIALS_PORT',
+);
+
+export interface CredentialsPort<TUser = unknown> {
+  findUserByDto(dto: unknown): Promise<TUser | null>;
+  validatePassword(user: TUser, dto: unknown): Promise<boolean>;
+  createUser(dto: unknown): Promise<TUser>;
+  extractUserIdFromUser(user: TUser): unknown;
+}
+```
+
+端口只定义契约。brkpt-auth 在 `CredentialsService` 中实现业务逻辑，适配器决定如何查找、校验和创建用户。大多数适配器方法只是简单的字段映射，或者对现有用户服务的直接调用，[开始使用](../../guides/get-started/)中展示过这种写法。
+
+<Aside type="tip">
+  brkpt-auth 并不要求适配器放在特定文件夹下。把它们放在 `src/brkpt-auth/adapters/` 是本文档中沿用的约定，用来和 brkpt-auth 安装的文件在视觉上区分开，而不是硬性要求。
+</Aside>
+
+## 注册功能
+
+你需要在 `features.ts` 中列出每个已启用的功能，连同它的适配器（以及驱动，如果有的话）：
+
+```typescript title="src/brkpt-auth/features.ts"
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { sessionFeature } from './features/session/session.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+  // ...每个已启用的功能对应一项
+];
+```
+
+`BrkptAuthModule` 会把每个功能的控制器和提供者展平后合并进自身：
+
+```typescript title="src/brkpt-auth/brkpt-auth.module.ts"
+import { DynamicModule, Module } from '@nestjs/common';
+import { JwtModule } from '@nestjs/jwt';
+
+import { BRKPT_AUTH_MODULE_OPTIONS } from './common/constants';
+import {
+  BrkptAuthModuleAsyncOptions,
+  BrkptAuthModuleOptions,
+} from './common/interfaces';
+import { features } from './features';
+
+@Module({
+  controllers: [...features.flatMap((f) => f.controllers)],
+  providers: [...features.flatMap((f) => f.providers)],
+})
+export class BrkptAuthModule {
+  static forRoot(options: BrkptAuthModuleOptions): DynamicModule {
+    return {
+      module: BrkptAuthModule,
+      imports: [
+        JwtModule.register({
+          global: true,
+          secret: options.jwt.access.secret,
+          signOptions: {
+            expiresIn: options.jwt.access.expiresIn,
+          },
+        }),
+      ],
+      providers: [
+        {
+          provide: BRKPT_AUTH_MODULE_OPTIONS,
+          useValue: options,
+        },
+      ],
+    };
+  }
+
+  static forRootAsync(options: BrkptAuthModuleAsyncOptions): DynamicModule {
+    return {
+      module: BrkptAuthModule,
+      imports: [
+        ...(options.imports || []),
+        JwtModule.registerAsync({
+          global: true,
+          imports: options.imports || [],
+          inject: options.inject || [],
+          useFactory: async (...args: any) => {
+            const config = await options.useFactory.apply(null, args);
+            return {
+              secret: config.jwt.access.secret,
+              signOptions: {
+                expiresIn: config.jwt.access.expiresIn,
+              },
+            };
+          },
+        }),
+      ],
+      providers: [
+        ...(options.providers || []),
+        {
+          provide: BRKPT_AUTH_MODULE_OPTIONS,
+          useFactory: options.useFactory,
+          inject: options.inject,
+        },
+      ],
+    };
+  }
+}
+```
+
+大多数情况下你不需要手动改动 `BrkptAuthModule`：运行 `brkpt auth add <feature>` 会自动帮你更新 `features.ts`，具体见下文。只有当某个功能的适配器需要额外的导入（例如一个数据库模块），或者需要一个未通过 `features.ts` 注册的 provider 时，才需要直接编辑 `BrkptAuthModule`。
+
+## 目录结构
+
+启用了若干功能之后，典型的 `src/brkpt-auth/` 文件夹是这样的：
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - core.adapter.ts
+      - credentials.adapter.ts
+      - session.adapter.ts
+      - ...
+    - common/
+      - constants/
+      - decorators/
+      - interfaces/
+      - utils/
+    - features/
+      - core/
+        - guards/
+          - jwt.guard.ts
+          - jwt-refresh.guard.ts
+        - core.controller.ts
+        - core.feature.ts
+        - core.port.ts
+        - core.service.ts
+        - core.service.spec.ts
+      - credentials/
+        - dto/
+          - sign-in.dto.ts
+          - sign-up.dto.ts
+        - credentials.controller.ts
+        - credentials.feature.ts
+        - credentials.port.ts
+        - credentials.service.ts
+        - credentials.service.spec.ts
+      - oauth/
+        - drivers/
+        - dto/
+        - ...
+      - otp/
+      - magic-link/
+      - session/
+      - blacklist/
+      - verify-email/
+      - change-password/
+      - reset-password/
+      - audit/
+    - brkpt-auth.module.ts
+    - features.ts
+</FileTree>
+
+从上到下：
+
+- **`adapters/`** 存放你编写的适配器。如上所述，这个位置只是约定，不是强制要求。
+- **`common/`** 存放跨所有功能共用的常量、装饰器、共享接口和工具函数。它在 `brkpt auth init` 时拉取，不会随功能变化。
+- **`features/`** 每个功能一个文件夹。每个功能文件夹至少包含：
+  - `*.service.ts` — 该功能的业务逻辑
+  - `*.service.spec.ts` — 对应逻辑的单元测试
+  - `*.port.ts` — 你的适配器需要实现的接口
+  - `*.feature.ts` — 上文提到的注册函数
+
+  根据功能不同，可能还包含：
+  - `*.controller.ts` — HTTP 路由
+  - `dto/` — 这些路由对应的请求 DTO。有些生成时是空的，因为 brkpt-auth 不会假设注册或登录请求使用哪些字段；有些则结构固定，因为路由本身是固定的（比如 OTP 或 magic link）
+  - `*.driver.ts` — 该功能的驱动契约，适用于支持多种可互换实现的功能
+  - `drivers/` — brkpt-auth 内置的具体驱动（例如 Google 和 GitHub 的 OAuth 驱动）
+  - `*.guard.ts` — 由该功能的注册函数全局注册的守卫
+
+一个功能的驱动契约通常是这样的：
+
+```typescript title="src/brkpt-auth/features/oauth/oauth.driver.ts"
+import { Type } from '@nestjs/common';
+
+export const BRKPT_AUTH_OAUTH_DRIVER_MAP = Symbol(
+  'BRKPT_AUTH_OAUTH_DRIVER_MAP',
+);
+
+export interface OAuthDriver {
+  readonly provider: string;
+  verify(dto: unknown): Promise<unknown>;
+}
+
+export const oauthDriverMapProvider = (
+  ...driverClasses: Type<OAuthDriver>[]
+) => ({
+  provide: BRKPT_AUTH_OAUTH_DRIVER_MAP,
+  useFactory: (...drivers: OAuthDriver[]): Map<string, OAuthDriver> =>
+    new Map(drivers.map((d) => [d.provider, d])),
+  inject: driverClasses,
+});
+```
+
+适配器负责把一个功能接入你的应用，驱动则代表该功能内部可以互换的多种实现。`oauthFeature` 注册一个适配器和任意数量的驱动，`otp` 和 `magic-link` 用的是同一套模式。
+
+在根目录下，**`brkpt-auth.module.ts`** 是模块本身，**`features.ts`** 是你用来启用或禁用功能的列表。
+
+## 可移植性
+
+应用的全部身份验证代码都在 `brkpt-auth/` 内部。因为业务逻辑位于端口之后，具体实现细节留在了适配器里：一个功能的 service 从不依赖用户如何存储、JWT 载荷长什么样，或者用的是哪个数据库。迁移到另一个项目时，只需要复制 `brkpt-auth/` 并重写适配器。
+
+## CLI 自动化
+
+`@brkpt/cli` 负责这套工作流中机械性的部分。`brkpt auth init` 会从 brkpt-auth 仓库拉取 `core` 功能和共享的 `common/` 文件。`brkpt auth add <feature>` 会拉取某个具体功能的文件，在 `features.ts` 中为它添加一条记录（不带适配器参数，适配器仍需你自己编写并传入），并重新排列 `features.ts` 数组，确保全局注册的守卫顺序正确。

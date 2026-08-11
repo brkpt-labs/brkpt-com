@@ -1,0 +1,328 @@
+---
+title: 添加 OTP
+description: 添加通过邮件发送的一次性密码登录。
+sidebar:
+  order: 6
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+本指南承接添加 OAuth，添加 `otp` 功能。
+
+`otp` 功能让用户可以用一次性验证码登录。在本指南中，验证码通过邮件发送，存储在 Redis 中并设置较短的 TTL，使用和其他登录方式相同的用户模型和 JWT 流程。
+
+本指南使用 `email` 作为账号标识符。如果邮箱已存在，就登录该用户；如果不存在，就先创建一个新用户。
+
+## 前置条件
+
+- 已完成[添加 OAuth](../add-oauth/)的项目
+- 一个正在运行的 Redis 实例
+- 用于发送测试邮件的 SMTP 凭证
+
+## 添加 OTP 功能
+
+**添加功能**
+
+运行 CLI 命令：
+
+```bash
+brkpt auth add otp --driver email
+```
+
+CLI 会添加一个新的 `features/otp/` 文件夹，包含所选驱动的文件。
+
+<Aside type="tip">
+  你也可以直接运行 `brkpt auth add otp`，在交互式界面中选择驱动。
+</Aside>
+
+**配置 SMTP 变量**
+
+email 驱动通过 SMTP 发送 OTP 验证码。把 SMTP 相关变量添加到已有的 `.env` 文件中：
+
+```bash title=".env"
+SMTP_HOST="your-smtp-host"
+SMTP_PORT="587"
+SMTP_USER="your-smtp-user"
+SMTP_PASS="your-smtp-password"
+SMTP_FROM="no-reply@example.test"
+```
+
+关于搭建本地测试收件箱，见[本地测试邮件发送](../../recipes/test-email-delivery-locally/)。
+
+**配置 BrkptAuthModule**
+
+在 `BrkptAuthModule.forRootAsync` 中添加 `otp` 配置：
+
+```diff lang="typescript" title="src/app.module.ts"
+ BrkptAuthModule.forRootAsync({
+   imports: [ConfigModule],
+   inject: [ConfigService],
+   useFactory: (config: ConfigService) => ({
+     jwt: {
+       // ...
+     },
+     oauth: {
+       // ...
+     },
++    otp: {
++      expiresIn: '5m',
++      codeLength: 6,
++      emailClient: {
++        host: config.getOrThrow('SMTP_HOST'),
++        port: Number(config.getOrThrow('SMTP_PORT')),
++        user: config.getOrThrow('SMTP_USER'),
++        pass: config.getOrThrow('SMTP_PASS'),
++        from: config.getOrThrow('SMTP_FROM'),
++      },
++    },
+   }),
+ }),
+```
+
+`expiresIn` 控制 OTP 验证码的可用时长，`codeLength` 控制生成验证码的长度，`emailClient` 供 email 驱动用来发送验证码。
+
+**校验 DTO**
+
+大多数生成的 DTO 一开始是空的，但 OTP 功能已经包含固定字段，因为 OTP 端点使用的是固定的请求结构。
+
+本指南已经启用了 `ValidationPipe`，所以只需为生成的 DTO 添加校验装饰器。
+
+更新 `send.dto.ts`：
+
+```diff lang="typescript" title="src/brkpt-auth/features/otp/dto/send.dto.ts"
++import { IsString } from 'class-validator';
+
+ export class SendDto {
++  @IsString()
+   target!: string;
+ 
++  @IsString()
+   method!: string;
+ }
+```
+
+更新 `authenticate.dto.ts`：
+
+```diff lang="typescript" title="src/brkpt-auth/features/otp/dto/authenticate.dto.ts"
++import { IsString } from 'class-validator';
+
+ export class AuthenticateDto {
++  @IsString()
+   target!: string;
+ 
++  @IsString()
+   code!: string;
+ }
+```
+
+本指南使用 `method: "email"`，所以 `target` 是一个邮箱地址。DTO 把 `target` 保留为字符串类型，因为它的含义取决于所选的 method。
+
+**实现 `OtpAdapter`**
+
+OTP 适配器把验证码存进 Redis，把提交的 target 映射为 `UserProfile`，并负责查找或创建用户。
+
+创建 `otp.adapter.ts`，实现基于 Redis 和 Prisma 的 OTP 适配器：
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - otp.adapter.ts
+</FileTree>
+
+```typescript title="src/brkpt-auth/adapters/otp.adapter.ts"
+import { Inject, Injectable } from '@nestjs/common';
+import { type RedisClientType } from 'redis';
+
+import { User } from '../../../generated/prisma/client';
+import { PrismaService } from '../../prisma/prisma.service';
+import { OtpCodeData } from '../common/interfaces';
+import { OtpPort } from '../features/otp/otp.port';
+import { UserProfile } from './types';
+
+@Injectable()
+export class OtpAdapter implements OtpPort<User, UserProfile> {
+  constructor(
+    @Inject('REDIS_CLIENT') private readonly redis: RedisClientType,
+    private readonly prisma: PrismaService,
+  ) {}
+
+  private key(target: string) {
+    return `otp:${target}`;
+  }
+
+  async saveCode(
+    target: string,
+    data: OtpCodeData,
+    ttlMs: number,
+  ): Promise<void> {
+    await this.redis.set(this.key(target), JSON.stringify(data), {
+      expiration: { type: 'PX', value: ttlMs },
+    });
+  }
+
+  async getCodeData(target: string): Promise<OtpCodeData | null> {
+    const data = await this.redis.get(this.key(target));
+    return data ? (JSON.parse(data) as OtpCodeData) : null;
+  }
+
+  async deleteCode(target: string): Promise<void> {
+    await this.redis.del(this.key(target));
+  }
+
+  mapTargetToProfile(method: string, target: string): UserProfile | undefined {
+    switch (method) {
+      case 'email':
+        return { name: '', email: target };
+    }
+  }
+
+  async findOrCreateUserByProfile(
+    profile: UserProfile,
+  ): Promise<{ user: User; created: boolean }> {
+    const existing = await this.prisma.user.findUnique({
+      where: { email: profile.email },
+    });
+    if (existing) {
+      return { user: existing, created: false };
+    }
+
+    const user = await this.prisma.user.create({
+      data: {
+        name: profile.name,
+        email: profile.email,
+        password: '',
+      },
+    });
+
+    return { user, created: true };
+  }
+
+  extractUserIdFromUser(user: User): number {
+    return user.id;
+  }
+}
+```
+
+对于 `method: "email"`，本指南把提交的邮箱地址映射为 `UserProfile`。如果已经存在使用该邮箱的用户，就用已有的用户数据；如果不存在，会创建一个新用户，`name` 留空，因为 OTP 请求只提供了邮箱地址。你可以为自己的应用调整这个映射逻辑。
+
+<Aside type="note">
+  本指南中，通过 OTP 创建的用户密码字段存的是空字符串。这不代表可以用空密码登录：credentials 登录仍然会用 `bcrypt.compare` 校验提交的密码，而存储的空值并不是空密码的 bcrypt 哈希。后续功能可以让这些用户设置或重置密码，从而也能用邮箱和密码登录。
+</Aside>
+
+**注册功能**
+
+更新 `features.ts`，把 `OtpAdapter` 和 `EmailOtpDriver` 传给 `otpFeature`：
+
+```typescript title="src/brkpt-auth/features.ts" ins="OtpAdapter" ins="EmailOtpDriver"
+import { BlacklistAdapter } from './adapters/blacklist.adapter';
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { OAuthAdapter } from './adapters/oauth.adapter';
+import { OtpAdapter } from './adapters/otp.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { blacklistFeature } from './features/blacklist/blacklist.feature';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { GithubOAuthDriver } from './features/oauth/drivers/github.driver';
+import { GoogleOAuthDriver } from './features/oauth/drivers/google.driver';
+import { oauthFeature } from './features/oauth/oauth.feature';
+import { EmailOtpDriver } from './features/otp/drivers/email.driver';
+import { otpFeature } from './features/otp/otp.feature';
+import { sessionFeature } from './features/session/session.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  blacklistFeature(BlacklistAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+  oauthFeature(OAuthAdapter, GoogleOAuthDriver, GithubOAuthDriver),
+  otpFeature(OtpAdapter, EmailOtpDriver),
+];
+```
+
+只有传给 `otpFeature` 的驱动才会被启用。你可以在项目中保留某个驱动文件而不在这里启用它。
+
+## 运行并验证
+
+启动应用：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+`otp` 功能新增两个端点：
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/auth/otp/send` | 发送一个 OTP 验证码 |
+| `POST` | `/auth/otp/authenticate` | 用 OTP 验证码登录 |
+
+发送端点接收一个 `method` 字段，其值必须匹配一个已启用的 OTP 驱动。在本指南中，`EmailOtpDriver` 使用 `method = 'email'`，所以发送请求体中用 `"method": "email"`。
+
+**发送 OTP 验证码**
+
+给某个邮箱地址发送验证码：
+
+```http
+POST /auth/otp/send
+Content-Type: application/json
+
+{
+  "target": "kevin@example.com",
+  "method": "email"
+}
+```
+
+打开你配置的 SMTP 账号或测试收件箱，从邮件中复制 OTP 验证码。
+
+邮件正文大致是这样的：
+
+```text
+Your OTP code is: 127419
+```
+
+<Aside type="tip">
+  email 驱动是你项目里的源代码。要自定义邮件主题或正文，编辑 `features/otp/drivers/email.driver.ts` 中的 `send` 方法。
+</Aside>
+
+**用 OTP 验证码登录**
+
+把复制的验证码发送到认证端点：
+
+```http
+POST /auth/otp/authenticate
+Content-Type: application/json
+
+{
+  "target": "kevin@example.com",
+  "code": "127419"
+}
+```
+
+如果邮箱已存在，请求会登录该用户；如果不存在，会先创建一个新用户。两种情况返回的令牌结果和其他登录方式一样。
+
+<Aside type="note">
+  OTP 验证码会根据 `otp.expiresIn` 配置项过期。向同一个 target 发送新验证码会使之前的验证码失效，只有最新的验证码可以用于登录。
+</Aside>

@@ -1,0 +1,274 @@
+---
+title: 使用 Drizzle
+description: 用 Drizzle ORM 和 PostgreSQL 替换内存用户 repository。
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+本篇展示用 Drizzle 替代使用 Prisma中的 Prisma 配置。如果 Drizzle 是你选用的 ORM，可以参考这篇。
+
+只有 `CoreAdapter` 和 `CredentialsAdapter` 会改动，`brkpt-auth/` 中的其他部分不受影响。
+
+## 前置条件
+
+- 已完成[开始使用](../../guides/get-started/)的项目
+- 一个 PostgreSQL 数据库
+
+## 安装 Drizzle
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add drizzle-orm pg
+pnpm add -D drizzle-kit @types/pg
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install drizzle-orm pg
+npm install -D drizzle-kit @types/pg
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn add drizzle-orm pg
+yarn add -D drizzle-kit @types/pg
+```
+
+  </TabItem>
+</Tabs>
+
+## 配置数据库连接
+
+把 `DATABASE_URL` 添加到已有的 `.env` 文件中：
+
+```bash title=".env"
+DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/DB_NAME?schema=public"
+```
+
+## 定义 schema
+
+<FileTree>
+- src/
+  - db/
+    - schema.ts
+</FileTree>
+
+```typescript title="src/db/schema.ts"
+import { pgTable, serial, text } from 'drizzle-orm/pg-core';
+
+export const users = pgTable('users', {
+  id: serial('id').primaryKey(),
+  name: text('name').notNull(),
+  email: text('email').notNull().unique(),
+  password: text('password').notNull(),
+});
+
+export type User = typeof users.$inferSelect;
+```
+
+brkpt-auth 并不要求这个具体的表结构。你的适配器决定哪些字段用于 JWT 载荷、密码校验和安全的用户响应。
+
+## 创建 Drizzle client
+
+<FileTree>
+- src/
+  - db/
+    - db.module.ts
+</FileTree>
+
+```typescript title="src/db/db.module.ts"
+import { Module } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
+import { Pool } from 'pg';
+
+import * as schema from './schema';
+
+export const DRIZZLE = Symbol('DRIZZLE');
+export type DrizzleDb = NodePgDatabase<typeof schema>;
+
+@Module({
+  imports: [ConfigModule],
+  providers: [
+    {
+      provide: DRIZZLE,
+      inject: [ConfigService],
+      useFactory: (config: ConfigService): DrizzleDb => {
+        const pool = new Pool({
+          connectionString: config.getOrThrow('DATABASE_URL'),
+        });
+        return drizzle(pool, { schema });
+      },
+    },
+  ],
+  exports: [DRIZZLE],
+})
+export class DbModule {}
+```
+
+## 配置 `drizzle-kit`
+
+```typescript title="drizzle.config.ts"
+import { defineConfig } from 'drizzle-kit';
+
+export default defineConfig({
+  schema: './src/db/schema.ts',
+  out: './drizzle',
+  dialect: 'postgresql',
+  dbCredentials: {
+    url: process.env.DATABASE_URL!,
+  },
+});
+```
+
+把 schema 推送到数据库：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm drizzle-kit push
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npx drizzle-kit push
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn drizzle-kit push
+```
+
+  </TabItem>
+</Tabs>
+
+<Aside type="tip">
+  `drizzle-kit push` 用于本地开发很方便。如果需要真实的迁移历史记录，改用 `drizzle-kit generate` 加 `drizzle-kit migrate`。
+</Aside>
+
+## 重写 `CoreAdapter`
+
+```typescript title="src/brkpt-auth/adapters/core.adapter.ts"
+import { Inject, Injectable } from '@nestjs/common';
+import { eq } from 'drizzle-orm';
+
+import { DRIZZLE, type DrizzleDb } from '../../db/db.module';
+import { type User, users } from '../../db/schema';
+import { CorePort } from '../features/core/core.port';
+import { AuthJwtPayload } from './types';
+
+@Injectable()
+export class CoreAdapter implements CorePort<User> {
+  constructor(@Inject(DRIZZLE) private readonly db: DrizzleDb) {}
+
+  mapUserToJwtPayload(user: User): AuthJwtPayload {
+    return {
+      sub: user.id,
+      email: user.email,
+    };
+  }
+
+  shrinkJwtPayload(payload: AuthJwtPayload): Record<string, unknown> {
+    return {
+      sub: payload.sub,
+    };
+  }
+
+  async findUserByJwtPayload(payload: AuthJwtPayload): Promise<User | null> {
+    const [user] = await this.db
+      .select()
+      .from(users)
+      .where(eq(users.id, payload.sub));
+    return user ?? null;
+  }
+
+  toSafeUser(user: User): Record<string, unknown> {
+    const { password: _password, ...safe } = user;
+    return safe;
+  }
+
+  extractUserIdFromJwtPayload(payload: AuthJwtPayload): number {
+    return payload.sub;
+  }
+}
+```
+
+## 重写 `CredentialsAdapter`
+
+```typescript title="src/brkpt-auth/adapters/credentials.adapter.ts"
+import { Inject, Injectable } from '@nestjs/common';
+import * as bcrypt from 'bcrypt';
+import { eq } from 'drizzle-orm';
+
+import { DRIZZLE, type DrizzleDb } from '../../db/db.module';
+import { type User, users } from '../../db/schema';
+import { CredentialsPort } from '../features/credentials/credentials.port';
+import { SignInDto } from '../features/credentials/dto/sign-in.dto';
+import { SignUpDto } from '../features/credentials/dto/sign-up.dto';
+
+@Injectable()
+export class CredentialsAdapter implements CredentialsPort<User> {
+  constructor(@Inject(DRIZZLE) private readonly db: DrizzleDb) {}
+
+  async findUserByDto(dto: SignInDto | SignUpDto): Promise<User | null> {
+    const [user] = await this.db
+      .select()
+      .from(users)
+      .where(eq(users.email, dto.email));
+    return user ?? null;
+  }
+
+  validatePassword(user: User, dto: SignInDto): Promise<boolean> {
+    return bcrypt.compare(dto.password, user.password);
+  }
+
+  async createUser(dto: SignUpDto): Promise<User> {
+    const password = await bcrypt.hash(dto.password, 10);
+    const [user] = await this.db
+      .insert(users)
+      .values({ name: dto.name, email: dto.email, password })
+      .returning();
+    return user;
+  }
+
+  extractUserIdFromUser(user: User): number {
+    return user.id;
+  }
+}
+```
+
+## 接入 `DbModule`
+
+在 `brkpt-auth.module.ts` 中，把内存实现的 `UserModule` 替换成 `DbModule`：
+
+```diff lang="typescript" title="src/brkpt-auth/brkpt-auth.module.ts"
+-import { UserModule } from '../user/user.module';
++import { DbModule } from '../db/db.module';
+
+@Module({
+-  imports: [UserModule],
++  imports: [DbModule],
+  controllers: [...features.flatMap((f) => f.controllers)],
+  providers: [...features.flatMap((f) => f.providers)],
+})
+export class BrkptAuthModule {
+  // ...
+}
+```
+
+现在可以移除开始使用中创建的 `src/user/` 文件夹了，它的唯一作用就是提供内存 repository。
+
+## 运行并验证
+
+启动应用，按开始使用中的方式通过 `/auth/sign-up` 注册。创建的用户现在通过 Drizzle 存储在 PostgreSQL 中，重启服务后依然存在。

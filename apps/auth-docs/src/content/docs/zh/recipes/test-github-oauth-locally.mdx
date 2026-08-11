@@ -1,0 +1,90 @@
+---
+title: 本地测试 GitHub OAuth
+description: 获取一个 GitHub 授权码，在没有前端的情况下测试 brkpt-auth 的 OAuth 登录。
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+本篇介绍如何获取一个真实的 GitHub 授权 `code`，并把它发送给添加 OAuth 中的 `oauth` 端点。
+
+当你已经完成[添加 OAuth](../../guides/add-oauth/)，但还没有前端登录页面时，可以用这个方法。
+
+<Aside type="caution">
+  OAuth 令牌和授权码可以用来验证请求身份，测试期间请妥善保管，不要泄露。
+</Aside>
+
+## 前置条件
+
+- 已完成[添加 OAuth](../../guides/add-oauth/)的项目
+- 已在 `.env` 中配置好 GitHub OAuth client 凭证
+- 一个用于发送测试请求的 HTTP 客户端
+
+## 创建一个 GitHub OAuth App
+
+对于简单的"用 GitHub 登录"流程，创建一个 GitHub OAuth App 就够了。只有当应用需要 GitHub App 特有的权限或仓库集成时，才需要 GitHub App。
+
+参考 GitHub 的[创建 OAuth App](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)指南。
+
+对于没有前端的本地测试，可以使用：
+
+```text
+Homepage URL: http://localhost:3000
+Authorization callback URL: http://localhost:3000/callback
+```
+
+本篇不需要这个回调页面真实存在。如果浏览器跳转到 `/callback` 后显示 404，那是正常的，直接从地址栏复制 `code` 查询参数即可。
+
+## 获取一个 GitHub 授权码
+
+用你的 GitHub OAuth App client ID 构造一个授权 URL：
+
+```text
+https://github.com/login/oauth/authorize?client_id=<github-client-id>&scope=read:user%20user:email
+```
+
+把 `<github-client-id>` 替换成你用于 `GITHUB_CLIENT_ID` 的同一个值。
+
+在浏览器中打开这个 URL，并授权该应用。
+
+GitHub 会跳转到你的回调 URL：
+
+```text
+http://localhost:3000/callback?code=<github-code>
+```
+
+从地址栏复制 `code` 的值。
+
+<Aside type="note">
+  `code` 是短期有效且只能使用一次的。如果请求因为 code 过期或已被使用而失败，重新走一遍授权流程，复制一个新的 code。
+</Aside>
+
+## 调用 brkpt-auth 端点
+
+把复制的 code 发送到你本地的 NestJS 服务：
+
+```http
+POST /auth/oauth/github
+Content-Type: application/json
+
+{
+  "code": "<github-code>"
+}
+```
+
+GitHub 驱动会用这个 code 换取 GitHub access token，获取 GitHub 用户资料，再把校验通过的提供商数据返回给 brkpt-auth。
+
+如果邮箱已存在，请求会登录该用户；如果不存在，会先创建一个新用户。两种情况返回的令牌结果和其他登录方式一样。
+
+## 故障排查
+
+**请求被判定为无效或已过期。**
+
+重新打开授权 URL 获取一个新的 `code`。GitHub 授权码是短期有效且一次性的。
+
+**GitHub 返回的用户资料不包含邮箱地址。**
+
+如果用户设置了邮箱为私密，GitHub 可能会返回 `email: null`。添加 OAuth 中的示例适配器会拒绝这类资料，因为用户模型要求必须有邮箱。本地测试时，可以使用一个公开邮箱的账号，或者在你自己的 GitHub 流程中获取用户的主要已验证邮箱。
+
+**驱动期望的字段名不一样。**
+
+检查你所选驱动的 `verify` 方法。请求体的字段名必须和该方法读取的字段一致。

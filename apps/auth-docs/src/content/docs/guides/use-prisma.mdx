@@ -1,0 +1,395 @@
+---
+title: Use Prisma
+description: Replace the in-memory user repository with Prisma and PostgreSQL.
+sidebar:
+  order: 2
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This guide continues from Get started and replaces the in-memory user repository with Prisma and PostgreSQL.
+
+By the end of this guide, users created through `/auth/sign-up` will be stored in a persistent database instead of memory.
+
+## Prerequisites
+
+- A project completed from [Get started](../get-started/)
+- A PostgreSQL database
+
+## Install Prisma
+
+Install Prisma, Prisma Client, the PostgreSQL driver adapter, and `pg`:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add -D prisma
+pnpm add @prisma/client @prisma/adapter-pg pg
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install -D prisma
+npm install @prisma/client @prisma/adapter-pg pg
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn add -D prisma
+yarn add @prisma/client @prisma/adapter-pg pg
+```
+
+  </TabItem>
+</Tabs>
+
+## Initialize Prisma
+
+Run the Prisma init command from the project root:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm dlx prisma init --output ../generated/prisma
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npx prisma init --output ../generated/prisma
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn dlx prisma init --output ../generated/prisma
+```
+
+  </TabItem>
+</Tabs>
+
+This creates a `prisma/schema.prisma` file and configures the generated Prisma Client output path.
+
+## Configure the database connection
+
+Add `DATABASE_URL` to your existing `.env` file:
+
+```bash title=".env"
+DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/DB_NAME?schema=public"
+```
+
+Replace `USER`, `PASSWORD`, and `DB_NAME` with your PostgreSQL username, password, and database name.
+
+## Define the user model
+
+Update `prisma/schema.prisma`:
+
+```diff lang="prisma" title="prisma/schema.prisma"
+generator client {
+  provider     = "prisma-client"
+  output       = "../generated/prisma"
++  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
++model User {
++  id       Int    @id @default(autoincrement())
++  name     String
++  email    String @unique
++  password String
++}
+```
+
+<Aside type="note">
+  The `moduleFormat = "cjs"` option keeps the generated client compatible with the default CommonJS setup used by this guide.
+</Aside>
+
+The `User` model matches the example user shape from Get started. brkpt-auth does not require this exact model. Your adapters decide which fields are used for JWT payloads, password validation, and safe user responses.
+
+## Run the migration
+
+Create and apply the initial migration:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm dlx prisma migrate dev --name init
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npx prisma migrate dev --name init
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn dlx prisma migrate dev --name init
+```
+
+  </TabItem>
+</Tabs>
+
+Then generate Prisma Client:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm dlx prisma generate
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npx prisma generate
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn dlx prisma generate
+```
+
+  </TabItem>
+</Tabs>
+
+## Create PrismaModule
+
+Create the following files:
+
+<FileTree>
+- src/
+  - prisma/
+    - prisma.module.ts
+    - prisma.service.ts
+</FileTree>
+
+**Create `PrismaService`**
+
+Create `prisma.service.ts` and wrap the generated `PrismaClient`:
+
+```typescript title="src/prisma/prisma.service.ts"
+import { Injectable } from '@nestjs/common';
+import { PrismaPg } from '@prisma/adapter-pg';
+
+import { PrismaClient } from '../../generated/prisma/client';
+
+@Injectable()
+export class PrismaService extends PrismaClient {
+  constructor() {
+    const adapter = new PrismaPg({
+      connectionString: process.env.DATABASE_URL as string,
+    });
+
+    super({ adapter });
+  }
+}
+```
+
+**Create `PrismaModule`**
+
+Create `prisma.module.ts` and export `PrismaService` so the adapters can inject it:
+
+```typescript title="src/prisma/prisma.module.ts"
+import { Module } from '@nestjs/common';
+
+import { PrismaService } from './prisma.service';
+
+@Module({
+  providers: [PrismaService],
+  exports: [PrismaService],
+})
+export class PrismaModule {}
+```
+
+## Replace UserModule with PrismaModule
+
+In Get started, `BrkptAuthModule` imported `UserModule` so the adapters could inject `MemoryUserRepository`.
+
+Now replace `UserModule` with `PrismaModule`:
+
+```diff lang="typescript" title="src/brkpt-auth/brkpt-auth.module.ts"
+-import { UserModule } from '../user/user.module';
++import { PrismaModule } from '../prisma/prisma.module';
+
+ @Module({
+-  imports: [UserModule],
++  imports: [PrismaModule],
+   controllers: [...features.flatMap((f) => f.controllers)],
+   providers: [...features.flatMap((f) => f.providers)],
+ })
+ export class BrkptAuthModule {
+   // ...
+ }
+```
+
+<Aside type="note">
+  Some NestJS projects register `PrismaModule` globally. This guide imports `PrismaModule` directly in `BrkptAuthModule` to keep the adapter dependency explicit. If your application already provides `PrismaService` globally, you do not need to add `PrismaModule` here.
+</Aside>
+
+## Update the adapters
+
+The brkpt-auth features do not need to change. Only the adapters need to use `PrismaService` instead of `MemoryUserRepository`.
+
+**Update `CoreAdapter`**
+
+Update `CoreAdapter` to use `PrismaService` instead of `MemoryUserRepository`:
+
+```typescript title="src/brkpt-auth/adapters/core.adapter.ts"
+import { Injectable } from '@nestjs/common';
+
+import { User } from '../../../generated/prisma/client';
+import { PrismaService } from '../../prisma/prisma.service';
+import { CorePort } from '../features/core/core.port';
+import { AuthJwtPayload } from './types';
+
+@Injectable()
+export class CoreAdapter implements CorePort<User> {
+  constructor(private readonly prisma: PrismaService) {}
+
+  mapUserToJwtPayload(user: User): AuthJwtPayload {
+    return {
+      sub: user.id,
+      email: user.email,
+    };
+  }
+
+  shrinkJwtPayload(payload: AuthJwtPayload): Record<string, unknown> {
+    return {
+      sub: payload.sub,
+    };
+  }
+
+  findUserByJwtPayload(payload: AuthJwtPayload): Promise<User | null> {
+    return this.prisma.user.findUnique({
+      where: {
+        id: payload.sub,
+      },
+    });
+  }
+
+  toSafeUser(user: User): Record<string, unknown> {
+    const { password: _password, ...safe } = user;
+    return safe;
+  }
+
+  extractUserIdFromJwtPayload(payload: AuthJwtPayload): number {
+    return payload.sub;
+  }
+}
+```
+
+**Update `CredentialsAdapter`**
+
+Update `CredentialsAdapter` to use `PrismaService` instead of `MemoryUserRepository`:
+
+```typescript title="src/brkpt-auth/adapters/credentials.adapter.ts"
+import { Injectable } from '@nestjs/common';
+import * as bcrypt from 'bcrypt';
+
+import { User } from '../../../generated/prisma/client';
+import { PrismaService } from '../../prisma/prisma.service';
+import { CredentialsPort } from '../features/credentials/credentials.port';
+import { SignInDto } from '../features/credentials/dto/sign-in.dto';
+import { SignUpDto } from '../features/credentials/dto/sign-up.dto';
+
+@Injectable()
+export class CredentialsAdapter implements CredentialsPort<User> {
+  constructor(private readonly prisma: PrismaService) {}
+
+  findUserByDto(dto: SignInDto | SignUpDto): Promise<User | null> {
+    return this.prisma.user.findUnique({
+      where: {
+        email: dto.email,
+      },
+    });
+  }
+
+  validatePassword(user: User, dto: SignInDto): Promise<boolean> {
+    return bcrypt.compare(dto.password, user.password);
+  }
+
+  async createUser(dto: SignUpDto): Promise<User> {
+    const password = await bcrypt.hash(dto.password, 10);
+    return this.prisma.user.create({
+      data: {
+        name: dto.name,
+        email: dto.email,
+        password,
+      },
+    });
+  }
+
+  extractUserIdFromUser(user: User): number {
+    return user.id;
+  }
+}
+```
+
+<Aside type="note">
+  Prisma generates the `User` type from `schema.prisma`, so the adapters no longer need the manually defined `src/user/user.entity.ts` type from Get started.
+</Aside>
+
+## Remove the in-memory user module
+
+You can now remove the `src/user/` folder created in Get started:
+
+<FileTree>
+- src/
+  - user/
+    - repositories/
+      - memory-user.repository.ts
+    - user.entity.ts
+    - user.module.ts
+</FileTree>
+
+That folder only existed to provide `MemoryUserRepository` for the in-memory example. After switching the adapters to `PrismaService`, it is no longer used.
+
+## Run and verify
+
+Start the application:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+Create a user through `/auth/sign-up`, restart the server, then sign in with the same account again.
+
+The sign-in request should still succeed because the user is now stored in PostgreSQL.

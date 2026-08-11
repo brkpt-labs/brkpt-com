@@ -1,0 +1,434 @@
+---
+title: Verify email
+description: Require users to verify an email before accessing protected routes.
+sidebar:
+  order: 10
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This guide adds the `verify-email` feature.
+
+The `verify-email` feature lets users verify an email before accessing protected routes. It uses verification features such as `otp` or `magic-link` as verification strategies. These features can be used not only for authentication, but also by other flows that need to verify account ownership.
+
+## Update the user model
+
+This guide stores the verified email in a nullable `verifiedEmail` field.
+
+Update `prisma/schema.prisma`:
+
+```diff lang="prisma" title="prisma/schema.prisma"
+model User {
+  id            Int     @id @default(autoincrement())
+  name          String
+  email         String  @unique
+  password      String
++  verifiedEmail String?
+}
+```
+
+<Aside type="note">
+  The `verifiedEmail` field is only one way to model email verification. brkpt-auth does not require this exact user structure. Your adapter decides how verification state is stored.
+</Aside>
+
+## Run the migration
+
+Create and apply a migration:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm dlx prisma migrate dev --name add-verified-email
+```
+
+  </TabItem>
+
+  <TabItem label="npm">
+
+```bash
+npx prisma migrate dev --name add-verified-email
+```
+
+  </TabItem>
+
+  <TabItem label="yarn">
+
+```bash
+yarn dlx prisma migrate dev --name add-verified-email
+```
+
+  </TabItem>
+</Tabs>
+
+Then generate Prisma Client:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm dlx prisma generate
+```
+
+  </TabItem>
+
+  <TabItem label="npm">
+
+```bash
+npx prisma generate
+```
+
+  </TabItem>
+
+  <TabItem label="yarn">
+
+```bash
+yarn dlx prisma generate
+```
+
+  </TabItem>
+</Tabs>
+
+## Add the verify email feature
+
+**Add the feature**
+
+Run the CLI command:
+
+```bash
+brkpt auth add verify-email
+```
+
+The CLI adds a new `features/verify-email/` folder.
+
+**Validate the DTOs**
+
+This guide already uses `ValidationPipe`, so add validation decorators to the generated DTOs:
+
+```diff lang="typescript" title="src/brkpt-auth/features/verify-email/dto/send.dto.ts"
++import { IsString } from 'class-validator';
+
+ export class SendDto {
++  @IsString()
+   target!: string;
+
++  @IsString()
+   strategy!: string;
+ }
+```
+
+```diff lang="typescript" title="src/brkpt-auth/features/verify-email/dto/verify.dto.ts"
++import { IsOptional, IsString } from 'class-validator';
+
+ export class VerifyDto {
++  @IsOptional()
++  @IsString()
+   target?: string;
+
++  @IsString()
+   strategy!: string;
+
++  @IsString()
+   proof!: string;
+ }
+```
+
+The `verify-email` feature always verifies an email, so the send request does not need a `method` field.
+
+**Implement the adapter**
+
+Create an adapter that reads and updates the user's verified email:
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - verify-email.adapter.ts
+</FileTree>
+
+```typescript title="src/brkpt-auth/adapters/verify-email.adapter.ts"
+import { Injectable } from '@nestjs/common';
+
+import { PrismaService } from '../../prisma/prisma.service';
+import { VerifyEmailPort } from '../features/verify-email/verify-email.port';
+import { AuthJwtPayload } from './types';
+
+@Injectable()
+export class VerifyEmailAdapter implements VerifyEmailPort {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async isVerified(payload: AuthJwtPayload): Promise<boolean> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: payload.sub },
+    });
+    return user?.verifiedEmail != null;
+  }
+
+  async markVerified(
+    payload: AuthJwtPayload,
+    target: string,
+  ): Promise<void> {
+    await this.prisma.user.update({
+      where: { id: payload.sub },
+      data: {
+        verifiedEmail: target,
+      },
+    });
+  }
+
+  extractUserIdFromJwtPayload(payload: AuthJwtPayload): number {
+    return payload.sub;
+  }
+}
+```
+
+<Aside type="note">
+  The verified email does not have to be the email used to sign in. Your adapter decides how the verified address is stored or associated with the user.
+</Aside>
+
+**Register the feature**
+
+Update `features.ts` and pass `VerifyEmailAdapter` to `verifyEmailFeature`:
+
+```typescript title="src/brkpt-auth/features.ts" ins="VerifyEmailAdapter"
+import { BlacklistAdapter } from './adapters/blacklist.adapter';
+import { ChangePasswordAdapter } from './adapters/change-password.adapter';
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { MagicLinkAdapter } from './adapters/magic-link.adapter';
+import { OAuthAdapter } from './adapters/oauth.adapter';
+import { OtpAdapter } from './adapters/otp.adapter';
+import { ResetPasswordAdapter } from './adapters/reset-password.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { VerifyEmailAdapter } from './adapters/verify-email.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { blacklistFeature } from './features/blacklist/blacklist.feature';
+import { changePasswordFeature } from './features/change-password/change-password.feature';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { EmailMagicLinkDriver } from './features/magic-link/drivers/email.driver';
+import { magicLinkFeature } from './features/magic-link/magic-link.feature';
+import { GithubOAuthDriver } from './features/oauth/drivers/github.driver';
+import { GoogleOAuthDriver } from './features/oauth/drivers/google.driver';
+import { oauthFeature } from './features/oauth/oauth.feature';
+import { EmailOtpDriver } from './features/otp/drivers/email.driver';
+import { otpFeature } from './features/otp/otp.feature';
+import { resetPasswordFeature } from './features/reset-password/reset-password.feature';
+import { sessionFeature } from './features/session/session.feature';
+import { verifyEmailFeature } from './features/verify-email/verify-email.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  blacklistFeature(BlacklistAdapter),
+  verifyEmailFeature(VerifyEmailAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+  oauthFeature(OAuthAdapter, GoogleOAuthDriver, GithubOAuthDriver),
+  otpFeature(OtpAdapter, EmailOtpDriver),
+  magicLinkFeature(MagicLinkAdapter, EmailMagicLinkDriver),
+  changePasswordFeature(ChangePasswordAdapter),
+  resetPasswordFeature(ResetPasswordAdapter),
+];
+```
+
+Registering `verify-email` also enables its global guard. Public routes remain accessible, while other routes require a verified email unless they are explicitly exempted.
+
+## Exempt routes from email verification
+
+Use `@SkipVerifyEmail()` on routes that should remain accessible before the user verifies an email.
+
+For example, you may allow users to view their account and sign out:
+
+```diff lang="typescript" title="src/brkpt-auth/features/core/core.controller.ts"
++import { SkipVerifyEmail } from '../../common/decorators/skip-verify-email.decorator';
+
++@SkipVerifyEmail()
+@Get('me')
+me(@Req() req: BrkptAuthRequest) {
+  return this.coreService.me(req.user!);
+}
+
++@SkipVerifyEmail()
+@Post('sign-out')
+@HttpCode(200)
+async signOut(
+  @Req() req: BrkptAuthRequest,
+  @Res({ passthrough: true }) response: Response,
+) {
+  await this.coreService.signOut(req.user!, extractRequestMetadata(req));
+
+  clearRefreshToken(response);
+
+  return 'Signed out successfully';
+}
+```
+
+Which routes should be exempt depends on your application. For the verification test below, leave `@SkipVerifyEmail()` off `me()` so `/auth/me` can demonstrate the difference before and after verification.
+
+## Configure the magic link callback
+
+OTP can be used immediately with the configuration from the previous guides.
+
+To also use magic link for email verification, add the `verifyEmail` callback URL:
+
+```diff lang="typescript" title="src/app.module.ts"
+magicLink: {
+  expiresIn: '5m',
+  callbackUrls: {
+    authenticate: 'http://localhost:3000/auth/magic-link/authenticate',
+    resetPassword: 'http://localhost:3000/auth/reset-password/reset',
++    verifyEmail: 'http://localhost:3000/auth/verify-email/verify',
+  },
+},
+```
+
+<Aside type="note">
+  This callback URL is only for demonstration. Since the verification endpoint requires a `POST` request and an access token, clicking the generated link does not verify the email by itself.
+
+  In production, this URL should point to a frontend route. The frontend reads the token from the link and sends it to the verification endpoint with the user's access token.
+</Aside>
+
+## Run and verify
+
+Start the application:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+The `verify-email` feature adds two endpoints:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/auth/verify-email/send` | Send email verification |
+| `POST` | `/auth/verify-email/verify` | Verify the email |
+
+Before verification, a protected route such as `/auth/me` returns `403 Forbidden`:
+
+```http
+GET /auth/me
+Authorization: Bearer <access-token>
+```
+
+```json
+{
+  "message": "Your account does not have a verified email. Please verify an email to continue.",
+  "error": "Forbidden",
+  "statusCode": 403
+}
+```
+
+**Verify an email with OTP**
+
+Send an OTP to the email you want to verify:
+
+```http
+POST /auth/verify-email/send
+Authorization: Bearer <access-token>
+Content-Type: application/json
+
+{
+  "target": "kevin@example.com",
+  "strategy": "otp"
+}
+```
+
+The email contains an OTP for the verification flow:
+
+```text
+Subject: Your OTP code to verify your email
+
+Your OTP code is: 127419
+```
+
+Submit the target and verification proof:
+
+```http
+POST /auth/verify-email/verify
+Authorization: Bearer <access-token>
+Content-Type: application/json
+
+{
+  "target": "kevin@example.com",
+  "strategy": "otp",
+  "proof": "127419"
+}
+```
+
+After verification, `/auth/me` becomes accessible:
+
+```http
+GET /auth/me
+Authorization: Bearer <access-token>
+```
+
+```json
+{
+  "id": 1,
+  "name": "Kevin",
+  "email": "kevin@example.com",
+  "verifiedEmail": "kevin@example.com"
+}
+```
+
+**Verify an email with magic link**
+
+Send a magic link to the email you want to verify:
+
+```http
+POST /auth/verify-email/send
+Authorization: Bearer <access-token>
+Content-Type: application/json
+
+{
+  "target": "kevin@example.com",
+  "strategy": "magic-link"
+}
+```
+
+The email contains a link like:
+
+```text
+Subject: Your magic link to verify your email
+
+Click the link to continue: http://localhost:3000/auth/verify-email/verify?token=<magic-link-token>
+```
+
+For this backend-only example, copy the token from the link and submit it as the verification proof:
+
+```http
+POST /auth/verify-email/verify
+Authorization: Bearer <access-token>
+Content-Type: application/json
+
+{
+  "strategy": "magic-link",
+  "proof": "<magic-link-token>"
+}
+```
+
+Magic link verification does not require `target` because the verified email is recovered from the token.
+
+A successful verification stores the verified email through your adapter and allows the user to access routes protected by the global verify-email guard.

@@ -1,0 +1,196 @@
+---
+title: Verification strategies
+description: How otp and magic-link work both as sign-in methods and as verification strategies for other features.
+sidebar:
+  order: 4
+---
+
+Features like `otp` and `magic-link` aren't only sign-in methods. `reset-password` and `verify-email` need the same underlying capability: proof that a user controls a given email, phone number, or other identifier. Instead of each reimplementing code generation, delivery, and storage, they reuse `otp` and `magic-link` as pluggable verification strategies.
+
+## Listening for verification requests
+
+Each verification-capable feature's service listens for two generic events, and only responds when the requested `strategy` matches its own name. Here's `otp`:
+
+```typescript title="src/brkpt-auth/features/otp/otp.service.ts"
+@OnEvent('brkpt-auth.verification.send', { suppressErrors: false })
+async handleVerificationSend({
+  target,
+  strategy,
+  method,
+  purpose,
+}: VerificationSendEvent) {
+  if (strategy !== 'otp') {
+    return;
+  }
+  await this.send(target, method, purpose);
+  return true;
+}
+
+@OnEvent('brkpt-auth.verification.verify', { suppressErrors: false })
+async handleVerificationVerify({
+  target,
+  strategy,
+  purpose,
+  proof,
+}: VerificationVerifyEvent): Promise<VerificationVerifyResult | undefined> {
+  if (strategy !== 'otp') {
+    return;
+  }
+
+  if (!target) {
+    throw new BadRequestException('Target is required for OTP verification');
+  }
+
+  const data = await this.port.getCodeData(target);
+  if (!data || data.code !== proof || data.purpose !== purpose) {
+    throw new UnauthorizedException('Invalid or expired OTP code');
+  }
+
+  await this.port.deleteCode(target);
+
+  return { target, method: data.method };
+}
+```
+
+`magic-link` implements the same two handlers, filtering on `strategy !== 'magic-link'` instead. Both `brkpt-auth.verification.send` and `brkpt-auth.verification.verify` are commands (see [Events](../events/)). Because multiple verification features can be enabled at once, more than one listener may receive the same event, and only the one whose `strategy` matches does anything.
+
+## Consuming a verification strategy
+
+A feature like `reset-password` doesn't know or care which verification features are enabled. It emits the generic event and checks what comes back:
+
+```typescript title="src/brkpt-auth/features/reset-password/reset-password.service.ts"
+async send(target: string, strategy: string, method: string) {
+  const user = await this.port.findUserByTarget(method, target);
+  if (!user) {
+    throw new UnauthorizedException('User not found');
+  }
+
+  const results = await this.eventEmitter.emitAsync(
+    'brkpt-auth.verification.send',
+    {
+      target,
+      strategy,
+      method,
+      purpose: 'resetPassword',
+    } satisfies VerificationSendEvent,
+  );
+  if (!results.some((r) => r === true)) {
+    throw new BadRequestException(
+      `Unsupported verification strategy: ${strategy}`,
+    );
+  }
+}
+
+async reset(
+  strategy: string,
+  proof: string,
+  newPassword: string,
+  target?: string,
+  metadata?: RequestMetadata,
+) {
+  const results = await this.eventEmitter.emitAsync(
+    'brkpt-auth.verification.verify',
+    { target, strategy, purpose: 'resetPassword', proof } satisfies VerificationVerifyEvent,
+  );
+
+  const verification = results.find(
+    (result): result is VerificationVerifyResult => result != null,
+  );
+  if (!verification) {
+    throw new BadRequestException(
+      `Unsupported verification strategy: ${strategy}`,
+    );
+  }
+
+  const user = await this.port.findUserByTarget(
+    verification.method,
+    verification.target,
+  );
+  if (!user) {
+    throw new UnauthorizedException('User not found');
+  }
+
+  await this.port.updatePassword(user, newPassword);
+
+  void this.eventEmitter.emitAsync('brkpt-auth.session.revoke-others', {
+    sessionId: '',
+    userId: this.port.extractUserIdFromUser(user),
+  } satisfies SessionRevokeOthersEvent);
+
+  void this.eventEmitter.emitAsync('brkpt-auth.reset-password.reset', {
+    userId: this.port.extractUserIdFromUser(user),
+    timestamp: Date.now(),
+    metadata,
+  } satisfies ResetPasswordEvent);
+}
+```
+
+`emitAsync` returns every listener's return value as an array. `send` checks whether *any* listener reported success (`true`); `reset` looks for the first non-null `VerificationVerifyResult`. If the requested `strategy` doesn't match any enabled feature, every listener returns early with `undefined`, and `reset-password` reports it as an unsupported strategy, without needing to know `otp` or `magic-link` exist.
+
+Once a reset succeeds, `reset-password` also revokes every other session for that user through `brkpt-auth.session.revoke-others`, and reports the reset itself as a domain event that `audit` can pick up.
+
+## Purposes keep verification data scoped
+
+Because the same `otp` code or `magic-link` token can be requested for different reasons, the stored data always includes a `purpose` alongside the proof itself:
+
+```typescript title="src/brkpt-auth/common/interfaces/index.ts"
+export interface OtpCodeData {
+  code: string;
+  method: string;
+  purpose: VerificationPurpose;
+}
+
+export interface MagicLinkTokenData {
+  target: string;
+  method: string;
+  purpose: VerificationPurpose;
+}
+
+export type VerificationPurpose =
+  | 'authenticate'
+  | 'verifyEmail'
+  | 'resetPassword';
+
+export interface VerificationSendEvent {
+  target: string;
+  strategy: string;
+  method: string;
+  purpose: VerificationPurpose;
+}
+
+export interface VerificationVerifyEvent {
+  target?: string;
+  strategy: string;
+  purpose: VerificationPurpose;
+  proof: string;
+}
+
+export interface VerificationVerifyResult {
+  target: string;
+  method: string;
+}
+```
+
+A code sent for `resetPassword` is checked against `purpose === 'resetPassword'` in `handleVerificationVerify` above, so it can't also be used to sign in. `target` on `VerificationVerifyEvent` is optional because not every strategy needs it supplied up front: `otp` requires a `target` to look up the stored code, while `magic-link` can recover the target from the token itself.
+
+## Authenticate is the default purpose
+
+When `otp` or `magic-link` is used directly for sign-in, rather than through the generic verification events above, it defaults `purpose` to `'authenticate'` and talks to `CoreService` directly instead of going through `reset-password` or `verify-email`:
+
+```typescript title="src/brkpt-auth/features/otp/otp.service.ts"
+async authenticate(target: string, code: string, metadata?: RequestMetadata) {
+  const data = await this.port.getCodeData(target);
+  if (!data || data.code !== code || data.purpose !== 'authenticate') {
+    throw new UnauthorizedException('Invalid or expired OTP code');
+  }
+
+  await this.port.deleteCode(target);
+
+  const profile = this.port.mapTargetToProfile(data.method, target);
+  // ...find or create the user from `profile`
+
+  return this.coreService.generateTokens(user, metadata);
+}
+```
+
+This is why `otp` and `magic-link` each implement two separate paths: their own `authenticate()` method for sign-in, and the `verification.send` / `verification.verify` listeners for everything else. Both call the same underlying send, store, and check logic, with a different `purpose` and a different destination for the result.

@@ -1,0 +1,321 @@
+---
+title: Add magic link
+description: Add passwordless sign-in with email magic links.
+sidebar:
+  order: 7
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This guide continues from [Add OTP](../add-otp/) and adds the `magic-link` feature.
+
+The `magic-link` feature lets users sign in with a link sent to their email address. In this guide, the link contains a one-time token, the token is stored in Redis with a short TTL, and the same user model and JWT flow are used as the other sign-in methods.
+
+This guide uses `email` as the account identifier. If the email already exists, the user signs in. If it does not exist, a new user is created first.
+
+## Prerequisites
+
+- A project completed from [Add OTP](../add-otp/)
+- A running Redis instance
+- SMTP credentials for sending emails
+
+## Add the magic link feature
+
+**Add the feature**
+
+Run the CLI command:
+
+```bash
+brkpt auth add magic-link --driver email
+```
+
+The CLI adds a new `features/magic-link/` folder with the selected driver files.
+
+<Aside type="tip">
+  You can also run `brkpt auth add magic-link` and select drivers interactively.
+</Aside>
+
+**Configure BrkptAuthModule**
+
+Add the `magicLink` options to `BrkptAuthModule.forRootAsync`:
+
+```diff lang="typescript" title="src/app.module.ts"
+ BrkptAuthModule.forRootAsync({
+   imports: [ConfigModule],
+   inject: [ConfigService],
+   useFactory: (config: ConfigService) => ({
+     jwt: {
+       // ...
+     },
+     oauth: {
+       // ...
+     },
+     otp: {
+       // ...
+     },
++    magicLink: {
++      expiresIn: '5m',
++      callbackUrls: {
++        authenticate: 'http://localhost:3000/auth/magic-link/authenticate',
++      },
++      emailClient: {
++        host: config.getOrThrow('SMTP_HOST'),
++        port: Number(config.getOrThrow('SMTP_PORT')),
++        user: config.getOrThrow('SMTP_USER'),
++        pass: config.getOrThrow('SMTP_PASS'),
++        from: config.getOrThrow('SMTP_FROM'),
++      },
++    },
+   }),
+ }),
+```
+
+`expiresIn` controls how long a magic link token can be used. `callbackUrls.authenticate` is the URL placed inside the sign-in link. `emailClient` is used by the email driver to send the link.
+
+Only the `authenticate` callback URL is required in this guide. Later verification-based features can add their own callback URLs when they use magic links for actions such as email verification or password reset.
+
+<Aside type="note">
+  This guide points `callbackUrls.authenticate` directly to the backend endpoint so the flow can be tested without a frontend.
+
+  In production, this URL usually points to a frontend route. The frontend extracts the token from the link and sends it to the backend authentication endpoint for verification.
+</Aside>
+
+**Validate the DTOs**
+
+The magic link feature uses a fixed request shape. This guide has already enabled `ValidationPipe`, so add validation decorators to the generated DTOs.
+
+`send.dto.ts` validates the request body for sending a link:
+
+```diff lang="typescript" title="src/brkpt-auth/features/magic-link/dto/send.dto.ts"
++import { IsString } from 'class-validator';
+
+ export class SendDto {
++  @IsString()
+   target!: string;
+
++  @IsString()
+   method!: string;
+ }
+```
+
+`authenticate.dto.ts` validates the query parameters from the magic link:
+
+```diff lang="typescript" title="src/brkpt-auth/features/magic-link/dto/authenticate.dto.ts"
++import { IsString } from 'class-validator';
+
+ export class AuthenticateDto {
++  @IsString()
+   token!: string;
+ }
+```
+
+**Implement `MagicLinkAdapter`**
+
+The magic link adapter stores one-time token data in Redis, maps the saved target to `UserProfile`, and finds or creates a user.
+
+Create `magic-link.adapter.ts`:
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - magic-link.adapter.ts
+</FileTree>
+
+```typescript title="src/brkpt-auth/adapters/magic-link.adapter.ts"
+import { Inject, Injectable } from '@nestjs/common';
+import { type RedisClientType } from 'redis';
+
+import { User } from '../../../generated/prisma/client';
+import { PrismaService } from '../../prisma/prisma.service';
+import { MagicLinkTokenData } from '../common/interfaces';
+import { MagicLinkPort } from '../features/magic-link/magic-link.port';
+import { UserProfile } from './types';
+
+@Injectable()
+export class MagicLinkAdapter implements MagicLinkPort<User, UserProfile> {
+  constructor(
+    @Inject('REDIS_CLIENT')
+    private readonly redis: RedisClientType,
+    private readonly prisma: PrismaService,
+  ) {}
+
+  private key(token: string) {
+    return `magic-link:${token}`;
+  }
+
+  async saveToken(
+    token: string,
+    data: MagicLinkTokenData,
+    ttlMs: number,
+  ): Promise<void> {
+    await this.redis.set(this.key(token), JSON.stringify(data), {
+      expiration: { type: 'PX', value: ttlMs },
+    });
+  }
+
+  async getTokenData(token: string): Promise<MagicLinkTokenData | null> {
+    const data = await this.redis.get(this.key(token));
+    return data ? (JSON.parse(data) as MagicLinkTokenData) : null;
+  }
+
+  async deleteToken(token: string): Promise<void> {
+    await this.redis.del(this.key(token));
+  }
+
+  mapTargetToProfile(method: string, target: string): UserProfile | undefined {
+    switch (method) {
+      case 'email':
+        return { name: '', email: target };
+    }
+  }
+
+  async findOrCreateUserByProfile(
+    profile: UserProfile,
+  ): Promise<{ user: User; created: boolean }> {
+    const existing = await this.prisma.user.findUnique({
+      where: { email: profile.email },
+    });
+    if (existing) {
+      return { user: existing, created: false };
+    }
+
+    const user = await this.prisma.user.create({
+      data: {
+        name: profile.name,
+        email: profile.email,
+        password: '',
+      },
+    });
+
+    return { user, created: true };
+  }
+
+  extractUserIdFromUser(user: User): number {
+    return user.id;
+  }
+}
+```
+
+The adapter stores each magic link token as `magic-link:{token}`. The saved value includes the target, method, and purpose for the token.
+
+For `method: "email"`, this guide maps the saved email address to `UserProfile`. If a user with that email already exists, the stored user data is used. If no user exists, a new user is created with an empty `name` because the magic link request only provides an email address. You can change this mapping logic for your own application.
+
+<Aside type="note">
+  Magic-link-created users store an empty password in this guide. This does not make empty-password sign-in possible: credentials sign-in still verifies the submitted password with `bcrypt.compare`, and an empty stored value is not the bcrypt hash of an empty password. Later features can let these users set or reset a password, so they can also sign in with email and password.
+</Aside>
+
+**Register the feature**
+
+Update `features.ts` and pass `MagicLinkAdapter` and `EmailMagicLinkDriver` to `magicLinkFeature`:
+
+```typescript title="src/brkpt-auth/features.ts" ins="MagicLinkAdapter" ins="EmailMagicLinkDriver"
+import { BlacklistAdapter } from './adapters/blacklist.adapter';
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { MagicLinkAdapter } from './adapters/magic-link.adapter';
+import { OAuthAdapter } from './adapters/oauth.adapter';
+import { OtpAdapter } from './adapters/otp.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { blacklistFeature } from './features/blacklist/blacklist.feature';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { EmailMagicLinkDriver } from './features/magic-link/drivers/email.driver';
+import { magicLinkFeature } from './features/magic-link/magic-link.feature';
+import { GithubOAuthDriver } from './features/oauth/drivers/github.driver';
+import { GoogleOAuthDriver } from './features/oauth/drivers/google.driver';
+import { oauthFeature } from './features/oauth/oauth.feature';
+import { EmailOtpDriver } from './features/otp/drivers/email.driver';
+import { otpFeature } from './features/otp/otp.feature';
+import { sessionFeature } from './features/session/session.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  blacklistFeature(BlacklistAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+  oauthFeature(OAuthAdapter, GoogleOAuthDriver, GithubOAuthDriver),
+  otpFeature(OtpAdapter, EmailOtpDriver),
+  magicLinkFeature(MagicLinkAdapter, EmailMagicLinkDriver),
+];
+```
+
+Only drivers passed to `magicLinkFeature` are enabled. You can keep a driver file in the project without enabling it here.
+
+## Run and verify
+
+Start the application:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+The `magic-link` feature adds two endpoints:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/auth/magic-link/send` | Send a magic link |
+| `GET` | `/auth/magic-link/authenticate` | Sign in with a magic link |
+
+The send endpoint receives a `method` field. The value must match an enabled magic link driver. In this guide, `EmailMagicLinkDriver` uses `method = 'email'`, so the send request body uses `"method": "email"`.
+
+**Send a magic link**
+
+Send a link to an email address:
+
+```http
+POST /auth/magic-link/send
+Content-Type: application/json
+
+{
+  "target": "kevin@example.com",
+  "method": "email"
+}
+```
+
+Open the inbox for the SMTP account or test inbox you configured. The email should look similar to this:
+
+```text
+Subject: Your magic link to sign in
+
+Click the link to continue: http://localhost:3000/auth/magic-link/authenticate?token=<magic-link-token>
+```
+
+<Aside type="tip">
+  The email driver is source code in your project. To customize the email subject or body, edit the `send` method in `features/magic-link/drivers/email.driver.ts`.
+</Aside>
+
+**Authenticate with the magic link**
+
+Open the link in a browser, or send the same request from an HTTP client:
+
+```http
+GET /auth/magic-link/authenticate?token=<magic-link-token>
+```
+
+If the email already exists, the request signs in that user. If it does not exist, a new user is created first. Both cases return the same token result as the other sign-in methods.
+
+<Aside type="note">
+  Magic link tokens expire according to the `magicLink.expiresIn` option. A token is deleted after a successful authentication, so the same link cannot be used again.
+</Aside>

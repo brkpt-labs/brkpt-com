@@ -1,0 +1,73 @@
+---
+title: 事件
+description: 独立的 brkpt-auth 功能如何通过 NestJS 的事件发射器进行通信。
+sidebar:
+  order: 3
+---
+
+brkpt-auth 使用事件发射器和监听器，让各个独立功能之间可以低耦合地通信。每个功能都可以被添加或移除，而不需要其他功能知道它的存在。
+
+这依赖于 NestJS `EventEmitter2` 的行为：发射器可以 `await` 一个事件并拿到每个监听器的返回值，而以 `{ suppressErrors: false }` 注册的监听器会把自己抛出的异常传回那个 `await`。如果某个事件根本没有注册任何监听器，`emitAsync` 就只会以一个空数组 resolve，调用方的流程不受影响。正是这一点，让 `session` 或 `blacklist` 这样的功能只在启用时才接入 `core` 的流程，而 `core` 完全不需要知道它是否存在。
+
+## 两类事件：按命名空间划分
+
+观察 brkpt-auth 的事件名会发现，根据命名空间那一段标识的对象不同，事件分为两类。
+
+**命令（Commands）**，命名空间指明了应该处理该事件的模块：
+
+- `brkpt-auth.session.revoke` — `session` 模块应该撤销这个会话
+- `brkpt-auth.session.revoke-others` — `session` 模块应该撤销除此之外的所有会话
+- `brkpt-auth.session.validate` — `session` 模块应该确认这个会话是否仍然有效
+- `brkpt-auth.verification.send` — 匹配到的验证模块应该发送一个凭证
+- `brkpt-auth.verification.verify` — 匹配到的验证模块应该校验一个凭证
+
+命令有明确的目标，通常只有一个监听器。发射器清楚自己在请求什么。
+
+**领域事件（Domain events）**，命名空间指明的是事件的发出者：
+
+- `brkpt-auth.core.sign-out`
+- `brkpt-auth.credentials.sign-in`
+- `brkpt-auth.reset-password.reset`
+- `brkpt-auth.session.anomaly`
+- `brkpt-auth.session.manual-revoke`
+
+领域事件是一次广播：“这件事发生了。”发射器不知道也不关心是否有谁在监听。比如 `audit` 会监听其中好几个事件，纯粹是为了记录，但发出事件的功能不依赖这一点。
+
+## 两类监听器：按流程控制划分
+
+与上面的分类正交，监听器还分为阻塞和非阻塞两种，这决定了一个事件能否打断调用方的流程。
+
+**阻塞**监听器设置了 `{ suppressErrors: false }`，发射器会 `await` 它的结果：
+
+```typescript title="src/brkpt-auth/features/session/session.service.ts"
+@OnEvent('brkpt-auth.session.validate', { suppressErrors: false })
+async handleSessionValidate({ sessionId }: SessionValidateEvent) {
+  const exists = await this.port.exists(sessionId);
+  if (!exists) {
+    throw new UnauthorizedException('Session expired or revoked');
+  }
+}
+```
+
+```typescript title="src/brkpt-auth/features/core/core.service.ts"
+await this.eventEmitter.emitAsync('brkpt-auth.session.validate', {
+  sessionId: payload.sid as string,
+} satisfies SessionValidateEvent);
+```
+
+如果监听器抛出异常，异常会在这个 `await` 处冒出来，当场中断刷新流程。如果 `session` 没有启用，就不存在监听器，也就不会有异常抛出，刷新流程照常进行，就像完全没有这个事件一样。这正是[JWT 与会话](../jwt-and-sessions/)能够保持可选的原因。
+
+**非阻塞**监听器不设置 `suppressErrors`，发射器用 `void` 触发它，而不是 `await`：
+
+```typescript title="src/brkpt-auth/features/core/core.service.ts"
+void this.eventEmitter.emitAsync('brkpt-auth.session.refresh', {
+  sessionId: payload.sid as string,
+  metadata,
+} satisfies SessionRefreshEvent);
+```
+
+无论 `session.refresh` 的监听器做了什么，比如更新 `lastActiveAt`，或者检测 IP、User-Agent 变化，都不会影响已经返回给客户端的响应，所以没有必要等它执行完。
+
+实践中，每个领域事件都是非阻塞的（`void`，不带 `suppressErrors`），因为广播这件事本身就不会阻塞任何东西。命令则要看调用方是否需要结果：`session.create` 和 `session.validate` 会被 `await`，因为调用流程依赖它们的结果；而 `session.refresh` 用 `void` 触发，因为调用流程不依赖它。
+
+把这两个维度（事件是发给谁的，以及它能否阻塞调用方）分开看待，就能让人读懂任意一处 `emitAsync` 调用，并推断出对应功能被禁用时会发生什么。

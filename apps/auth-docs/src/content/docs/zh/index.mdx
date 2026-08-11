@@ -1,0 +1,252 @@
+---
+title: brkpt-auth
+description: 面向 NestJS 的透明、可组合、可移植的六边形架构身份验证方案。
+template: splash
+
+hero:
+  tagline: 用完全属于你自己的源代码，为 NestJS 构建身份验证。设计上就是透明、可组合、可移植的六边形架构。
+  announcement:
+    text: v0.1.0 现已发布
+    link: https://github.com/brkpt-labs/brkpt-auth
+  actions:
+    - text: 开始使用
+      link: /auth/zh/guides/get-started/
+    - text: 源代码
+      link: https://github.com/brkpt-labs/brkpt-auth
+      variant: minimal
+---
+
+import { Card, CardGrid, Steps } from "@astrojs/starlight/components";
+import { ContainerSection } from "lucode-starlight/components";
+
+<div class="auth-splash">
+
+<ContainerSection>
+
+## 每种方案都有代价
+
+<CardGrid>
+  <Card title="托管服务" icon="cloud-download">
+    云端的黑盒。定制能力有限，且存在供应商锁定。
+  </Card>
+
+  <Card title="自托管类库" icon="server">
+    运行在你自己机器上的黑盒。厚重的抽象层让定制变得困难。
+  </Card>
+
+  <Card title="身份验证脚手架" icon="code-branch">
+    带有完整源代码，但架构偏好很强，往往需要大量改造才能适配。
+  </Card>
+
+  <Card title="完全自行开发" icon="pencil">
+    完全掌控，但每个项目都要重新搭建同一套基础设施。
+  </Card>
+</CardGrid>
+
+</ContainerSection>
+
+<ContainerSection>
+
+## 为什么选择 brkpt-auth
+
+<CardGrid>
+  <Card title="透明" icon="document">
+    完整源代码直接安装进你的项目。没有编译后的包，没有隐藏行为，结构清晰，便于检查和修改。
+  </Card>
+
+  <Card title="可组合" icon="puzzle">
+    只添加你需要的部分。各个独立功能之间通过事件通信，耦合度低。
+  </Card>
+
+  <Card title="非侵入" icon="padlock">
+    不对你的数据库 schema、用户模型或 JWT 载荷做任何假设。实现所需的端口即可完成集成，不必重构应用。
+  </Card>
+
+  <Card title="可移植" icon="random">
+    业务逻辑与适配器相互独立。把身份验证逻辑迁移到另一个项目时，只需替换适配器。
+  </Card>
+
+  <Card title="原生 NestJS" icon="approve-check-circle">
+    从一开始就围绕 NestJS 的模块、依赖注入、守卫、装饰器和提供者构建。
+  </Card>
+
+  <Card title="六边形架构" icon="setting">
+    边界清晰：服务承载业务逻辑，端口定义契约，适配器完全由你掌控。
+  </Card>
+</CardGrid>
+
+</ContainerSection>
+
+<ContainerSection>
+
+## 工作原理
+
+brkpt-auth 把稳定的身份验证逻辑和项目特定的实现细节分离开。身份验证能力被组织为一个个独立功能，适配器负责把这些功能接入你自己的应用。
+
+{/* <!-- TODO: 功能注册 / 架构流程图 --> */}
+
+每个功能都会被添加到项目中，通过适配器完成连接，并通过 `BrkptAuthModule` 注册。无论你启用的是 credentials、OAuth、session、blacklist 还是其他任何能力，集成方式都是一样的。
+
+功能之间通过事件而非直接依赖来通信，这样新增能力时不需要改动已有功能。没有添加的功能不会出现在 `BrkptAuthModule` 中。
+
+端口和适配器把基础设施隔离在身份验证核心之外。你的数据库 schema、用户模型、密码策略、JWT 载荷、验证规则和外部服务始终由你掌控。迁移到另一个项目时，通常只需替换适配器，而不用重写身份验证逻辑。
+
+会话管理构建在无状态 JWT 之上，而不是取代它。session 管理、令牌撤销这类有状态能力可以逐步添加，不需要改动核心身份验证流程。
+
+**brkpt-cli** 通过把源代码直接安装进你的项目、并将新功能接入同一套架构，帮你完成这套结构的搭建。
+
+</ContainerSection>
+
+<ContainerSection>
+
+## 集成起来难吗
+
+每个功能都遵循同一套集成流程：添加功能、实现适配器、完成注册。
+
+<Steps>
+
+1. ### 添加功能
+
+   用 **brkpt-cli** 把功能源代码添加到项目中。
+
+   ```bash title="添加 credentials 功能"
+   brkpt auth add credentials
+   ```
+
+2. ### 实现适配器
+
+   把功能端口接入你现有的应用代码。多数适配器方法只是简单的字段映射，或对某个服务的直接调用。
+
+   ```typescript "CredentialsAdapter"
+   // credentials.adapter.ts
+   @Injectable()
+   export class CredentialsAdapter implements CredentialsPort<User> {
+     constructor(private readonly prisma: PrismaService) {}
+
+     findUserByDto(dto: SignInDto | SignUpDto): Promise<User | null> {
+       return this.prisma.user.findUnique({ where: { email: dto.email } });
+     }
+
+     validatePassword(user: User, dto: SignInDto): Promise<boolean> {
+       return bcrypt.compare(dto.password, user.password);
+     }
+
+     async createUser(dto: SignUpDto): Promise<User> {
+       const password = await bcrypt.hash(dto.password, 10);
+       return this.prisma.user.create({
+         data: { email: dto.email, password },
+       });
+     }
+
+     extractUserIdFromUser(user: User): number {
+       return user.id;
+     }
+   }
+   ```
+
+3. ### 注册功能
+
+   **brkpt-cli** 会帮你更新 `features.ts`。实现适配器后，在生成的功能列表中把它传给对应的功能。
+
+   ```typescript ins="CredentialsAdapter"
+   // src/brkpt-auth/features.ts
+   export const features: FeatureConfig[] = [
+     coreFeature(CoreAdapter),
+     credentialsFeature(CredentialsAdapter),
+   ];
+   ```
+
+</Steps>
+
+就这样。`BrkptAuthModule` 在你的 `AppModule` 中注册后，添加的功能就成了同一套 NestJS 身份验证流程的一部分。
+
+根据功能不同，你可能还需要做一些常规的项目配置，比如安装依赖、设置环境变量、定义 DTO 或配置基础设施模块。
+
+</ContainerSection>
+
+<ContainerSection>
+
+## 可用功能
+
+brkpt-auth 把常见的身份验证能力组织成一个个独立功能。从 `core` 开始，之后只添加应用需要的功能。
+
+<div class="auth-feature-stack">
+  <section class="auth-feature-group auth-feature-group--foundation">
+    <h3>基础</h3>
+    <ul>
+      <li><code class="feature-badge feature-badge--core">core</code></li>
+    </ul>
+  </section>
+
+  <section class="auth-feature-group auth-feature-group--signin">
+    <h3>登录方式</h3>
+    <ul>
+      <li><code class="feature-badge feature-badge--credentials">credentials（账号密码）</code></li>
+      <li><code class="feature-badge feature-badge--oauth">oauth（第三方登录）</code></li>
+      <li><code class="feature-badge feature-badge--otp">otp（一次性密码）</code></li>
+      <li><code class="feature-badge feature-badge--magic">magic-link（魔术链接）</code></li>
+    </ul>
+  </section>
+
+  <section class="auth-feature-group auth-feature-group--token">
+    <h3>会话管理</h3>
+    <ul>
+      <li><code class="feature-badge feature-badge--session">session（会话）</code></li>
+      <li><code class="feature-badge feature-badge--blacklist">blacklist（黑名单）</code></li>
+    </ul>
+  </section>
+
+  <section class="auth-feature-group auth-feature-group--security">
+    <h3>账户安全</h3>
+    <ul>
+      <li><code class="feature-badge feature-badge--verify">verify-email（邮箱验证）</code></li>
+      <li><code class="feature-badge feature-badge--change">change-password（修改密码）</code></li>
+      <li><code class="feature-badge feature-badge--reset">reset-password（重置密码）</code></li>
+    </ul>
+  </section>
+
+  <section class="auth-feature-group auth-feature-group--events">
+    <h3>事件处理</h3>
+    <ul>
+      <li><code class="feature-badge feature-badge--audit">audit（审计日志）</code></li>
+    </ul>
+  </section>
+</div>
+
+</ContainerSection>
+
+<ContainerSection>
+
+## brkpt-auth 适合谁
+
+brkpt-auth 面向需要一套可拥有、可适配、并能随时间演进的身份验证代码的 NestJS 应用。
+
+<CardGrid>
+  <Card title="MVP 构建者" icon="rocket">
+    快速搭起一套能用的身份验证基础，随着产品演进再逐步添加 session、OAuth、OTP、审计日志等功能。
+  </Card>
+
+  <Card title="现有 NestJS 应用" icon="database">
+    项目已经有自己的用户模型、数据库、服务和基础设施。
+  </Card>
+
+  <Card title="长期维护的产品" icon="code-branch">
+    团队希望拥有一套可检查、可维护、能随时间演进的身份验证代码。
+  </Card>
+
+  <Card title="可组合的身份验证系统" icon="puzzle">
+    需要从简单起步，逐步添加身份验证能力，且不必重写已有功能的应用。
+  </Card>
+
+  <Card title="多项目开发者" icon="random">
+    希望在多个 NestJS 项目间复用身份验证逻辑，同时让每个项目自由选用各自的数据库、用户模型和基础设施。
+  </Card>
+
+  <Card title="重视架构的团队" icon="setting">
+    希望在身份验证逻辑、应用基础设施和项目特定实现之间保持清晰边界的团队。
+  </Card>
+</CardGrid>
+
+</ContainerSection>
+
+</div>

@@ -1,0 +1,223 @@
+---
+title: 使用 TypeORM
+description: 用 TypeORM 和 PostgreSQL 替换内存用户 repository。
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+本篇展示用 TypeORM 替代使用 Prisma中的 Prisma 配置。如果 TypeORM 是你选用的 ORM，可以参考这篇。
+
+只有 `CoreAdapter` 和 `CredentialsAdapter` 会改动，`brkpt-auth/` 中的其他部分不受影响。
+
+## 前置条件
+
+- 已完成[开始使用](../../guides/get-started/)的项目
+- 一个 PostgreSQL 数据库
+
+## 安装 TypeORM
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add @nestjs/typeorm typeorm pg
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install @nestjs/typeorm typeorm pg
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn add @nestjs/typeorm typeorm pg
+```
+
+  </TabItem>
+</Tabs>
+
+## 配置数据库连接
+
+把 `DATABASE_URL` 添加到已有的 `.env` 文件中：
+
+```bash title=".env"
+DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/DB_NAME?schema=public"
+```
+
+## 定义实体
+
+<FileTree>
+- src/
+  - user/
+    - user.entity.ts
+    - user.module.ts
+</FileTree>
+
+```typescript title="src/user/user.entity.ts"
+import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
+
+@Entity()
+export class User {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column()
+  name!: string;
+
+  @Column({ unique: true })
+  email!: string;
+
+  @Column()
+  password!: string;
+}
+```
+
+brkpt-auth 并不要求这个具体的实体结构。你的适配器决定哪些字段用于 JWT 载荷、密码校验和安全的用户响应。
+
+```typescript title="src/user/user.module.ts"
+import { Module } from '@nestjs/common';
+import { TypeOrmModule } from '@nestjs/typeorm';
+
+import { User } from './user.entity';
+
+@Module({
+  imports: [TypeOrmModule.forFeature([User])],
+  exports: [TypeOrmModule],
+})
+export class UserModule {}
+```
+
+## 注册 `TypeOrmModule`
+
+```typescript title="src/app.module.ts"
+import { Module } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { TypeOrmModule } from '@nestjs/typeorm';
+
+import { User } from './user/user.entity';
+import { UserModule } from './user/user.module';
+// ...现有的 brkpt-auth 导入
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
+    TypeOrmModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        type: 'postgres',
+        url: config.getOrThrow('DATABASE_URL'),
+        entities: [User],
+        synchronize: true,
+      }),
+    }),
+    UserModule,
+    // ...现有的 BrkptAuthModule.forRootAsync
+  ],
+})
+export class AppModule {}
+```
+
+<Aside type="caution">
+  `synchronize: true` 会根据实体自动生成 schema，用于本地开发很方便，但不要在生产环境中使用，改用 TypeORM 的迁移机制。
+</Aside>
+
+## 重写 `CoreAdapter`
+
+```typescript title="src/brkpt-auth/adapters/core.adapter.ts"
+import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+
+import { User } from '../../user/user.entity';
+import { CorePort } from '../features/core/core.port';
+import { AuthJwtPayload } from './types';
+
+@Injectable()
+export class CoreAdapter implements CorePort<User> {
+  constructor(
+    @InjectRepository(User) private readonly userRepo: Repository<User>,
+  ) {}
+
+  mapUserToJwtPayload(user: User): AuthJwtPayload {
+    return {
+      sub: user.id,
+      email: user.email,
+    };
+  }
+
+  shrinkJwtPayload(payload: AuthJwtPayload): Record<string, unknown> {
+    return {
+      sub: payload.sub,
+    };
+  }
+
+  findUserByJwtPayload(payload: AuthJwtPayload): Promise<User | null> {
+    return this.userRepo.findOneBy({ id: payload.sub });
+  }
+
+  toSafeUser(user: User): Record<string, unknown> {
+    const { password: _password, ...safe } = user;
+    return safe;
+  }
+
+  extractUserIdFromJwtPayload(payload: AuthJwtPayload): number {
+    return payload.sub;
+  }
+}
+```
+
+## 重写 `CredentialsAdapter`
+
+```typescript title="src/brkpt-auth/adapters/credentials.adapter.ts"
+import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import * as bcrypt from 'bcrypt';
+import { Repository } from 'typeorm';
+
+import { User } from '../../user/user.entity';
+import { CredentialsPort } from '../features/credentials/credentials.port';
+import { SignInDto } from '../features/credentials/dto/sign-in.dto';
+import { SignUpDto } from '../features/credentials/dto/sign-up.dto';
+
+@Injectable()
+export class CredentialsAdapter implements CredentialsPort<User> {
+  constructor(
+    @InjectRepository(User) private readonly userRepo: Repository<User>,
+  ) {}
+
+  findUserByDto(dto: SignInDto | SignUpDto): Promise<User | null> {
+    return this.userRepo.findOneBy({ email: dto.email });
+  }
+
+  validatePassword(user: User, dto: SignInDto): Promise<boolean> {
+    return bcrypt.compare(dto.password, user.password);
+  }
+
+  async createUser(dto: SignUpDto): Promise<User> {
+    const password = await bcrypt.hash(dto.password, 10);
+    const user = this.userRepo.create({
+      name: dto.name,
+      email: dto.email,
+      password,
+    });
+    return this.userRepo.save(user);
+  }
+
+  extractUserIdFromUser(user: User): number {
+    return user.id;
+  }
+}
+```
+
+## 更新 `brkpt-auth.module.ts`
+
+现在 `UserModule` 导出的是 `TypeOrmModule`，而不是内存 repository，所以这部分不需要改动。`brkpt-auth.module.ts` 在开始使用中已经导入了 `UserModule`。
+
+## 运行并验证
+
+启动应用，按开始使用中的方式通过 `/auth/sign-up` 注册。创建的用户现在通过 TypeORM 存储在 PostgreSQL 中，重启服务后依然存在。

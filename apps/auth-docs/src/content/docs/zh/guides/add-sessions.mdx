@@ -1,0 +1,350 @@
+---
+title: 添加会话管理
+description: 用 Redis 为 refresh token 添加会话管理。
+sidebar:
+  order: 3
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+本指南承接使用 Prisma，添加 `session` 功能。
+
+access token 依然保持短期有效、无状态。`session` 功能为 refresh token 添加了服务端状态，这样当某个会话被撤销时，对应的 refresh token 就会被拒绝。
+
+本指南使用 Redis 存储会话，因为它支持基于 TTL 的键，以及用于按用户建立会话索引的有序集合。
+
+完成本指南后，你的应用将能够列出活跃会话、撤销某个特定会话、撤销其他会话，并拒绝来自已撤销会话的刷新请求。
+
+<Aside type="note">
+  会话管理会在刷新时增加一次轻量的 Redis 查询。普通的、受 access token 保护的请求仍然是无状态的。
+</Aside>
+
+## 前置条件
+
+- 已完成[使用 Prisma](../use-prisma/)的项目
+- 一个正在运行的 Redis 实例
+
+## 安装 Redis 客户端
+
+安装本指南使用的 Redis 客户端：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add redis
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install redis
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn add redis
+```
+
+  </TabItem>
+</Tabs>
+
+## 配置 Redis 连接
+
+把 Redis 连接配置添加到已有的 `.env` 文件中：
+
+```bash title=".env"
+REDIS_HOST=localhost
+REDIS_PORT=6379
+```
+
+## 创建 RedisModule
+
+创建一个小型 Redis 模块，提供一个已连接的 Redis 客户端：
+
+<FileTree>
+- src/
+  - redis/
+    - redis.module.ts
+</FileTree>
+
+```typescript title="src/redis/redis.module.ts"
+import { Module } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { createClient } from 'redis';
+
+@Module({
+  imports: [ConfigModule],
+  providers: [
+    {
+      provide: 'REDIS_CLIENT',
+      inject: [ConfigService],
+      async useFactory(config: ConfigService) {
+        const client = createClient({
+          socket: {
+            host: config.getOrThrow('REDIS_HOST'),
+            port: Number(config.getOrThrow('REDIS_PORT')),
+          },
+        });
+        await client.connect();
+        return client;
+      },
+    },
+  ],
+  exports: ['REDIS_CLIENT'],
+})
+export class RedisModule {}
+```
+
+## 添加 session 功能
+
+**添加功能**
+
+运行 CLI 命令：
+
+```bash
+brkpt auth add session
+```
+
+CLI 会添加一个新的 `features/session/` 文件夹。
+
+**实现 `SessionAdapter`**
+
+session 适配器的方法比之前的适配器多，但大多数都是简单的 Redis 操作。
+
+它们分为两组：
+
+- **会话存储**：创建、读取、更新和删除一个会话。
+- **用户索引**：为每个用户维护一份会话列表，用于列出会话和批量撤销。
+
+下面的实现足以让你在 Redis 上跑起来。
+
+创建 `session.adapter.ts`：
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - session.adapter.ts
+</FileTree>
+
+```typescript title="src/brkpt-auth/adapters/session.adapter.ts"
+import { Inject, Injectable } from '@nestjs/common';
+import { type RedisClientType } from 'redis';
+
+import { SessionData } from '../common/interfaces';
+import { SessionPort } from '../features/session/session.port';
+import { AuthJwtPayload } from './types';
+
+@Injectable()
+export class SessionAdapter implements SessionPort {
+  constructor(
+    @Inject('REDIS_CLIENT') private readonly redis: RedisClientType,
+  ) {}
+
+  private key(sessionId: string) {
+    return `session:${sessionId}`;
+  }
+
+  private userIndexKey(userId: unknown) {
+    return `session:user:${String(userId)}`;
+  }
+
+  async create(
+    sessionId: string,
+    data: SessionData,
+    ttlMs: number,
+  ): Promise<void> {
+    await this.redis.set(this.key(sessionId), JSON.stringify(data), {
+      expiration: { type: 'PX', value: ttlMs },
+    });
+  }
+
+  async exists(sessionId: string): Promise<boolean> {
+    return !!(await this.redis.exists(this.key(sessionId)));
+  }
+
+  async findById(sessionId: string): Promise<SessionData | null> {
+    const data = await this.redis.get(this.key(sessionId));
+    return data ? (JSON.parse(data) as SessionData) : null;
+  }
+
+  async update(sessionId: string, data: SessionData): Promise<void> {
+    const key = this.key(sessionId);
+    const ttlMs = await this.redis.pTTL(key);
+    if (ttlMs > 0) {
+      await this.redis.set(key, JSON.stringify(data), {
+        expiration: { type: 'PX', value: ttlMs },
+      });
+    }
+  }
+
+  async delete(sessionId: string): Promise<void> {
+    await this.redis.del(this.key(sessionId));
+  }
+
+  async addToUserIndex(
+    userId: unknown,
+    sessionId: string,
+    expiresAt: number,
+  ): Promise<void> {
+    await this.redis.zAdd(this.userIndexKey(userId), {
+      score: expiresAt,
+      value: sessionId,
+    });
+  }
+
+  async removeFromUserIndex(userId: unknown, sessionId: string): Promise<void> {
+    await this.redis.zRem(this.userIndexKey(userId), sessionId);
+  }
+
+  async pruneUserIndex(userId: unknown, before: number): Promise<void> {
+    await this.redis.zRemRangeByScore(
+      this.userIndexKey(userId),
+      '-inf',
+      before,
+    );
+  }
+
+  getUserIndexSessionIds(userId: unknown): Promise<string[]> {
+    return this.redis.zRange(this.userIndexKey(userId), 0, -1);
+  }
+
+  extractUserIdFromJwtPayload(payload: AuthJwtPayload): number {
+    return payload.sub;
+  }
+}
+```
+
+<Aside type="note">
+  会话数据以 JSON 形式存储在 `session:{sessionId}` 下。按用户的会话索引以 Redis 有序集合的形式存储在 `session:user:{userId}` 下，用过期时间戳作为 score。
+</Aside>
+
+**注册功能**
+
+更新 `features.ts`，把 `SessionAdapter` 传给 `sessionFeature`：
+
+```typescript title="src/brkpt-auth/features.ts" ins="SessionAdapter"
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { sessionFeature } from './features/session/session.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+];
+```
+
+**导入 `RedisModule`**
+
+`SessionAdapter` 依赖 `REDIS_CLIENT`，而它是由 `RedisModule` 导出的。
+
+把 `RedisModule` 添加到 `brkpt-auth.module.ts`：
+
+```diff lang="typescript" title="src/brkpt-auth/brkpt-auth.module.ts"
+import { PrismaModule } from '../prisma/prisma.module';
++import { RedisModule } from '../redis/redis.module';
+
+@Module({
+-  imports: [PrismaModule],
++  imports: [PrismaModule, RedisModule],
+  controllers: [...features.flatMap((f) => f.controllers)],
+  providers: [...features.flatMap((f) => f.providers)],
+})
+export class BrkptAuthModule {
+  // ...
+}
+```
+
+<Aside type="note">
+  有些 NestJS 项目会全局注册 `RedisModule`。本指南把 `RedisModule` 直接导入 `BrkptAuthModule`，让适配器的依赖关系保持明确。如果你的应用已经全局提供了 `REDIS_CLIENT`，就不需要在这里再添加 `RedisModule`。
+</Aside>
+
+<Aside type="tip">
+  要禁用 `session` 功能，从 `features.ts` 中移除 `sessionFeature(SessionAdapter)` 即可。
+</Aside>
+
+## 运行并验证
+
+启动应用：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+`session` 功能新增以下端点：
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/auth/session` | 列出当前用户的活跃会话 |
+| `DELETE` | `/auth/session/:sessionId` | 撤销一个特定会话 |
+| `DELETE` | `/auth/session/others` | 撤销除当前会话外的所有会话 |
+
+使用开始使用中创建的账号，或者用 `/auth/sign-up` 创建一个新账号。
+
+**列出会话**
+
+用同一个账号登录多次，每次成功登录都会创建一个新会话。
+
+然后列出活跃会话：
+
+```http
+GET /auth/session
+Authorization: Bearer <access-token>
+```
+
+响应中应该包含当前用户的活跃会话。
+
+**撤销一个会话**
+
+按 id 撤销某一个会话：
+
+```http
+DELETE /auth/session/<session-id>
+Authorization: Bearer <access-token>
+```
+
+会话被撤销后，与该会话关联的 refresh token 就不能再用来调用 `/auth/refresh`。
+
+**撤销其他会话**
+
+撤销除当前会话外的所有会话：
+
+```http
+DELETE /auth/session/others
+Authorization: Bearer <access-token>
+```
+
+这对"在其他设备上登出"这类场景很有用。
+
+<Aside type="note">
+  撤销一个会话会使该会话的 refresh token 失效。已经签发的 access token 在过期之前仍然有效。要立即撤销 access token，可以继续阅读[添加 blacklist](../add-blacklist/)。
+</Aside>

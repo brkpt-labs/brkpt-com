@@ -1,0 +1,434 @@
+---
+title: 验证邮箱
+description: 要求用户在访问受保护路由之前验证邮箱。
+sidebar:
+  order: 10
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+本指南添加 `verify-email` 功能。
+
+`verify-email` 功能要求用户在访问受保护路由之前验证一个邮箱。它把 `otp` 或 `magic-link` 这样的验证功能用作验证策略。这些功能不仅可以用于登录，也可以被其他需要验证账户所有权的流程复用。
+
+## 更新用户模型
+
+本指南把已验证的邮箱存储在一个可为空的 `verifiedEmail` 字段中。
+
+更新 `prisma/schema.prisma`：
+
+```diff lang="prisma" title="prisma/schema.prisma"
+model User {
+  id            Int     @id @default(autoincrement())
+  name          String
+  email         String  @unique
+  password      String
++  verifiedEmail String?
+}
+```
+
+<Aside type="note">
+  `verifiedEmail` 字段只是建模邮箱验证的一种方式。brkpt-auth 并不要求这个具体的用户结构，验证状态如何存储由你的适配器决定。
+</Aside>
+
+## 运行迁移
+
+创建并应用一次迁移：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm dlx prisma migrate dev --name add-verified-email
+```
+
+  </TabItem>
+
+  <TabItem label="npm">
+
+```bash
+npx prisma migrate dev --name add-verified-email
+```
+
+  </TabItem>
+
+  <TabItem label="yarn">
+
+```bash
+yarn dlx prisma migrate dev --name add-verified-email
+```
+
+  </TabItem>
+</Tabs>
+
+然后生成 Prisma Client：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm dlx prisma generate
+```
+
+  </TabItem>
+
+  <TabItem label="npm">
+
+```bash
+npx prisma generate
+```
+
+  </TabItem>
+
+  <TabItem label="yarn">
+
+```bash
+yarn dlx prisma generate
+```
+
+  </TabItem>
+</Tabs>
+
+## 添加 verify email 功能
+
+**添加功能**
+
+运行 CLI 命令：
+
+```bash
+brkpt auth add verify-email
+```
+
+CLI 会添加一个新的 `features/verify-email/` 文件夹。
+
+**校验 DTO**
+
+本指南已经使用了 `ValidationPipe`，所以只需为生成的 DTO 添加校验装饰器：
+
+```diff lang="typescript" title="src/brkpt-auth/features/verify-email/dto/send.dto.ts"
++import { IsString } from 'class-validator';
+
+ export class SendDto {
++  @IsString()
+   target!: string;
+
++  @IsString()
+   strategy!: string;
+ }
+```
+
+```diff lang="typescript" title="src/brkpt-auth/features/verify-email/dto/verify.dto.ts"
++import { IsOptional, IsString } from 'class-validator';
+
+ export class VerifyDto {
++  @IsOptional()
++  @IsString()
+   target?: string;
+
++  @IsString()
+   strategy!: string;
+
++  @IsString()
+   proof!: string;
+ }
+```
+
+`verify-email` 功能始终是验证邮箱，所以发送请求不需要 `method` 字段。
+
+**实现适配器**
+
+创建一个适配器，负责读取和更新用户已验证的邮箱：
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - verify-email.adapter.ts
+</FileTree>
+
+```typescript title="src/brkpt-auth/adapters/verify-email.adapter.ts"
+import { Injectable } from '@nestjs/common';
+
+import { PrismaService } from '../../prisma/prisma.service';
+import { VerifyEmailPort } from '../features/verify-email/verify-email.port';
+import { AuthJwtPayload } from './types';
+
+@Injectable()
+export class VerifyEmailAdapter implements VerifyEmailPort {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async isVerified(payload: AuthJwtPayload): Promise<boolean> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: payload.sub },
+    });
+    return user?.verifiedEmail != null;
+  }
+
+  async markVerified(
+    payload: AuthJwtPayload,
+    target: string,
+  ): Promise<void> {
+    await this.prisma.user.update({
+      where: { id: payload.sub },
+      data: {
+        verifiedEmail: target,
+      },
+    });
+  }
+
+  extractUserIdFromJwtPayload(payload: AuthJwtPayload): number {
+    return payload.sub;
+  }
+}
+```
+
+<Aside type="note">
+  已验证的邮箱不一定要和登录用的邮箱相同。验证后的地址如何存储、如何与用户关联，由你的适配器决定。
+</Aside>
+
+**注册功能**
+
+更新 `features.ts`，把 `VerifyEmailAdapter` 传给 `verifyEmailFeature`：
+
+```typescript title="src/brkpt-auth/features.ts" ins="VerifyEmailAdapter"
+import { BlacklistAdapter } from './adapters/blacklist.adapter';
+import { ChangePasswordAdapter } from './adapters/change-password.adapter';
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { MagicLinkAdapter } from './adapters/magic-link.adapter';
+import { OAuthAdapter } from './adapters/oauth.adapter';
+import { OtpAdapter } from './adapters/otp.adapter';
+import { ResetPasswordAdapter } from './adapters/reset-password.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { VerifyEmailAdapter } from './adapters/verify-email.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { blacklistFeature } from './features/blacklist/blacklist.feature';
+import { changePasswordFeature } from './features/change-password/change-password.feature';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { EmailMagicLinkDriver } from './features/magic-link/drivers/email.driver';
+import { magicLinkFeature } from './features/magic-link/magic-link.feature';
+import { GithubOAuthDriver } from './features/oauth/drivers/github.driver';
+import { GoogleOAuthDriver } from './features/oauth/drivers/google.driver';
+import { oauthFeature } from './features/oauth/oauth.feature';
+import { EmailOtpDriver } from './features/otp/drivers/email.driver';
+import { otpFeature } from './features/otp/otp.feature';
+import { resetPasswordFeature } from './features/reset-password/reset-password.feature';
+import { sessionFeature } from './features/session/session.feature';
+import { verifyEmailFeature } from './features/verify-email/verify-email.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  blacklistFeature(BlacklistAdapter),
+  verifyEmailFeature(VerifyEmailAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+  oauthFeature(OAuthAdapter, GoogleOAuthDriver, GithubOAuthDriver),
+  otpFeature(OtpAdapter, EmailOtpDriver),
+  magicLinkFeature(MagicLinkAdapter, EmailMagicLinkDriver),
+  changePasswordFeature(ChangePasswordAdapter),
+  resetPasswordFeature(ResetPasswordAdapter),
+];
+```
+
+注册 `verify-email` 同时也会启用它的全局守卫。公开路由仍然可以访问，而其他路由则要求邮箱已验证，除非被显式豁免。
+
+## 让部分路由豁免邮箱验证
+
+在应该保持可访问、直到用户验证邮箱之前都不受限制的路由上使用 `@SkipVerifyEmail()`。
+
+例如，你可能希望允许用户查看账户信息和登出：
+
+```diff lang="typescript" title="src/brkpt-auth/features/core/core.controller.ts"
++import { SkipVerifyEmail } from '../../common/decorators/skip-verify-email.decorator';
+
++@SkipVerifyEmail()
+@Get('me')
+me(@Req() req: BrkptAuthRequest) {
+  return this.coreService.me(req.user!);
+}
+
++@SkipVerifyEmail()
+@Post('sign-out')
+@HttpCode(200)
+async signOut(
+  @Req() req: BrkptAuthRequest,
+  @Res({ passthrough: true }) response: Response,
+) {
+  await this.coreService.signOut(req.user!, extractRequestMetadata(req));
+
+  clearRefreshToken(response);
+
+  return 'Signed out successfully';
+}
+```
+
+哪些路由应该豁免取决于你的应用。为了下面的验证测试能演示验证前后的区别，这里先不在 `me()` 上加 `@SkipVerifyEmail()`，让 `/auth/me` 保留限制。
+
+## 配置 magic link 回调
+
+结合前面几篇指南的配置，OTP 可以直接使用。
+
+要让 magic link 也能用于邮箱验证，添加 `verifyEmail` 回调 URL：
+
+```diff lang="typescript" title="src/app.module.ts"
+magicLink: {
+  expiresIn: '5m',
+  callbackUrls: {
+    authenticate: 'http://localhost:3000/auth/magic-link/authenticate',
+    resetPassword: 'http://localhost:3000/auth/reset-password/reset',
++    verifyEmail: 'http://localhost:3000/auth/verify-email/verify',
+  },
+},
+```
+
+<Aside type="note">
+  这个回调 URL 只是用于演示。由于验证端点要求 `POST` 请求并携带 access token，直接点击生成的链接本身并不会完成邮箱验证。
+
+  在生产环境中，这个 URL 应该指向一个前端路由。前端从链接中读取令牌，连同用户的 access token 一起发送给验证端点。
+</Aside>
+
+## 运行并验证
+
+启动应用：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+`verify-email` 功能新增两个端点：
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/auth/verify-email/send` | 发送邮箱验证 |
+| `POST` | `/auth/verify-email/verify` | 验证邮箱 |
+
+在验证之前，像 `/auth/me` 这样的受保护路由会返回 `403 Forbidden`：
+
+```http
+GET /auth/me
+Authorization: Bearer <access-token>
+```
+
+```json
+{
+  "message": "Your account does not have a verified email. Please verify an email to continue.",
+  "error": "Forbidden",
+  "statusCode": 403
+}
+```
+
+**用 OTP 验证邮箱**
+
+给要验证的邮箱发送一个 OTP：
+
+```http
+POST /auth/verify-email/send
+Authorization: Bearer <access-token>
+Content-Type: application/json
+
+{
+  "target": "kevin@example.com",
+  "strategy": "otp"
+}
+```
+
+邮件中包含用于验证流程的 OTP：
+
+```text
+Subject: Your OTP code to verify your email
+
+Your OTP code is: 127419
+```
+
+提交 target 和验证凭证：
+
+```http
+POST /auth/verify-email/verify
+Authorization: Bearer <access-token>
+Content-Type: application/json
+
+{
+  "target": "kevin@example.com",
+  "strategy": "otp",
+  "proof": "127419"
+}
+```
+
+验证完成后，`/auth/me` 就可以访问了：
+
+```http
+GET /auth/me
+Authorization: Bearer <access-token>
+```
+
+```json
+{
+  "id": 1,
+  "name": "Kevin",
+  "email": "kevin@example.com",
+  "verifiedEmail": "kevin@example.com"
+}
+```
+
+**用 magic link 验证邮箱**
+
+给要验证的邮箱发送一个 magic link：
+
+```http
+POST /auth/verify-email/send
+Authorization: Bearer <access-token>
+Content-Type: application/json
+
+{
+  "target": "kevin@example.com",
+  "strategy": "magic-link"
+}
+```
+
+邮件中包含类似这样的链接：
+
+```text
+Subject: Your magic link to verify your email
+
+Click the link to continue: http://localhost:3000/auth/verify-email/verify?token=<magic-link-token>
+```
+
+在这个纯后端的示例中，从链接中复制令牌，把它作为验证凭证提交：
+
+```http
+POST /auth/verify-email/verify
+Authorization: Bearer <access-token>
+Content-Type: application/json
+
+{
+  "strategy": "magic-link",
+  "proof": "<magic-link-token>"
+}
+```
+
+magic link 验证不需要 `target`，因为已验证的邮箱会从令牌中还原出来。
+
+验证成功后，已验证的邮箱会通过你的适配器存储下来，用户也就能访问受全局 verify-email 守卫保护的路由了。

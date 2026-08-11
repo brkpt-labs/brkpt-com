@@ -1,0 +1,239 @@
+---
+title: JWT 与会话
+description: brkpt-auth 如何把无状态 JWT 身份验证和可选的、可撤销的会话结合起来。
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+brkpt-auth 的 `core` 功能默认是无状态的，但它可以扩展出会话管理，而不需要改动登录或路由保护逻辑。无论 `session` 功能是否启用，每次登录签发的令牌都会携带一个唯一的会话 id（`sid`）。
+
+## 每次登录都会拿到一个会话 id
+
+```typescript title="src/brkpt-auth/features/core/core.service.ts"
+async generateTokens(user: unknown, metadata?: RequestMetadata) {
+  const payload = this.port.mapUserToJwtPayload(user);
+  const sessionId = randomUUID();
+
+  const [accessToken, refreshToken] = await Promise.all([
+    this.jwtService.signAsync({
+      ...payload,
+      sid: sessionId,
+    }),
+    this.jwtService.signAsync(
+      {
+        ...(this.port.shrinkJwtPayload?.(payload) ?? payload),
+        sid: sessionId,
+      },
+      {
+        secret: this.options.jwt.refresh.secret,
+        expiresIn: this.options.jwt.refresh.expiresIn,
+      },
+    ),
+  ]);
+
+  await this.eventEmitter.emitAsync('brkpt-auth.session.create', {
+    sessionId,
+    userId: this.port.extractUserIdFromJwtPayload(payload),
+    ttlMs: parseDurationToMs(this.options.jwt.refresh.expiresIn),
+    metadata,
+  } satisfies SessionCreateEvent);
+
+  return { accessToken, refreshToken };
+}
+```
+
+如果你的适配器实现了 `shrinkJwtPayload`，refresh token 会用它去掉那些 access token 需要、但 refresh token 不需要的字段。如果没有启用 `session` 功能，`sid` 依然会被嵌入两个令牌，只是没有任何代码读取它。一旦启用 `session`，`brkpt-auth.session.create` 就会被监听到，并用这个 id 创建一条会话记录。关于功能如何监听这类事件，见[事件](../events/)。
+
+## Access token：无状态校验
+
+除了标记为 `@Public()` 的路由，其他所有路由都受一个全局的 `JwtGuard` 保护，它只校验 access token 的签名：
+
+```typescript title="src/brkpt-auth/features/core/guards/jwt.guard.ts"
+async canActivate(context: ExecutionContext): Promise<boolean> {
+  const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+    context.getHandler(),
+    context.getClass(),
+  ]);
+  if (isPublic) {
+    return true;
+  }
+
+  const request = context.switchToHttp().getRequest<BrkptAuthRequest>();
+  const token = this.extractToken(request);
+  if (!token) {
+    throw new UnauthorizedException('Invalid access token');
+  }
+
+  try {
+    const payload =
+      await this.jwtService.verifyAsync<Record<string, unknown>>(token);
+    request.user = payload;
+  } catch {
+    throw new UnauthorizedException('Invalid access token');
+  }
+
+  return true;
+}
+```
+
+这个检查完全不涉及数据库：一个语法有效、尚未过期的签名就足够了。这正是无状态 JWT 的意义所在，也是它通常的局限：没有办法在过期之前撤销某一个具体的 access token。
+
+## Refresh token 与 `JwtRefreshGuard`
+
+refresh 路由由另一个守卫 `JwtRefreshGuard` 单独保护，它用 refresh secret 校验签名，并根据配置从 cookie 或请求体中读取令牌：
+
+```typescript title="src/brkpt-auth/features/core/guards/jwt-refresh.guard.ts"
+private extractToken(request: BrkptAuthRequest): string | undefined {
+  switch (this.options.jwt.refresh.transport) {
+    case 'cookie':
+      return request.cookies?.['refreshToken'];
+    case 'body':
+      return (request.body as { refreshToken?: string } | undefined)
+        ?.refreshToken;
+  }
+}
+```
+
+校验通过后，`refresh()` 会签发一个新的 access token，refresh token 本身不受影响：
+
+```typescript title="src/brkpt-auth/features/core/core.service.ts"
+async refresh(payload: Record<string, unknown>, metadata?: RequestMetadata) {
+  await this.eventEmitter.emitAsync('brkpt-auth.session.validate', {
+    sessionId: payload.sid as string,
+  } satisfies SessionValidateEvent);
+
+  const user = await this.port.findUserByJwtPayload(payload);
+  if (!user) {
+    throw new UnauthorizedException('User not found');
+  }
+
+  const accessToken = await this.jwtService.signAsync({
+    ...this.port.mapUserToJwtPayload(user),
+    sid: payload.sid,
+  });
+
+  void this.eventEmitter.emitAsync('brkpt-auth.session.refresh', {
+    sessionId: payload.sid as string,
+    metadata,
+  } satisfies SessionRefreshEvent);
+
+  return { accessToken };
+}
+```
+
+## 让 refresh token 可撤销
+
+`brkpt-auth.session.validate` 正是 `session` 功能接入的地方。启用 `session` 后，一个监听器会在刷新之前检查会话是否仍然存在：
+
+```typescript title="src/brkpt-auth/features/session/session.service.ts"
+@OnEvent('brkpt-auth.session.validate', { suppressErrors: false })
+async handleSessionValidate({ sessionId }: SessionValidateEvent) {
+  const exists = await this.port.exists(sessionId);
+  if (!exists) {
+    throw new UnauthorizedException('Session expired or revoked');
+  }
+}
+```
+
+没有启用 `session` 功能时，这个事件没有监听器，什么都不会阻塞刷新流程，行为和纯粹的无状态 JWT 完全一样。启用之后，`sid` 就成了会话的把手：你可以列出某个用户的所有会话、撤销其中一个，或者撤销除当前会话外的所有会话，被撤销会话的 refresh token 在下次使用时就会失效。
+
+同一条刷新流程还会追踪 IP 和 User-Agent 的变化，并把它们上报为异常，`audit` 功能（或者你自己写的监听器）可以对此做出响应：
+
+```typescript title="src/brkpt-auth/features/session/session.service.ts"
+@OnEvent('brkpt-auth.session.refresh')
+async handleSessionRefresh({ sessionId, metadata }: SessionRefreshEvent) {
+  const sessionData = await this.port.findById(sessionId);
+  if (!sessionData) return;
+
+  sessionData.lastActiveAt = Date.now();
+
+  if (metadata?.ip && sessionData.metadata.ip !== metadata.ip) {
+    void this.eventEmitter.emitAsync('brkpt-auth.session.anomaly', {
+      sessionId,
+      userId: sessionData.userId,
+      type: 'ip_changed',
+      previous: sessionData.metadata.ip!,
+      current: metadata.ip,
+    } satisfies SessionAnomalyEvent);
+    sessionData.metadata.ip = metadata.ip;
+  }
+
+  // ...对 user agent 变化执行同样的检查
+
+  await this.port.update(sessionId, sessionData);
+}
+```
+
+<Aside type="note">
+  启用 `session` 后，每次刷新请求会多一次查询，通常是查 Redis。受 access token 保护的请求仍然完全无状态。
+</Aside>
+
+## 是会话，不是令牌轮换
+
+会话存储在 Redis 这类快速的外部存储中，而不是主用户表，这是出于性能考虑。刷新令牌不做轮换。
+
+这套设计既不是经典的服务端 `@session` cookie 模型，也不是许多基于 OAuth 的服务商采用的重新签发并使旧令牌失效的模式。一条持久化的会话记录才是唯一真相来源：登录时签发的两个令牌都只携带指向这条记录的指针（`sid`）。需要撤销、检查和管理的是会话记录，而不是令牌，直接通过 `sid` 操作即可。
+
+刷新令牌轮换是为了限制令牌泄露造成的损失：每个刷新令牌只能使用一次，使用后就会签发一个新的。如果一个已经用过的令牌被再次使用，就说明发生了泄露，可以借此撤销整条令牌链。代价是：如果泄露的令牌在合法客户端下一次刷新之前被使用，系统无法区分谁是攻击者、谁是真正的用户，谁后刷新谁就会被锁定。为了容忍并发刷新和不稳定的网络，通常还要加一个宽限期，而这个宽限期本身又会带来新的边界情况。
+
+这些问题在这里都不存在。`session.validate` 在每次刷新时都直接通过 `sid` 检查会话，刷新令牌在会话有效期内始终有效。
+
+如果某个会话看起来被盗用，可以直接通过 `sid` 撤销它，或者启用 `blacklist` 立即切断该会话的 access token，而不必等它自然过期。当会话的 IP 或 User-Agent 在生命周期内发生变化时，会触发 `brkpt-auth.session.anomaly`。
+
+## 立即撤销 access token
+
+撤销会话会让 refresh token 失效，但已经签发的 access token 在过期之前仍然有效。撤销会话不会追溯性地使已经发出的令牌失效。`blacklist` 功能通过第二个全局守卫补上这个空缺：
+
+```typescript title="src/brkpt-auth/features/blacklist/blacklist.guard.ts"
+async canActivate(context: ExecutionContext): Promise<boolean> {
+  const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+    context.getHandler(),
+    context.getClass(),
+  ]);
+  if (isPublic) {
+    return true;
+  }
+
+  const request = context.switchToHttp().getRequest<BrkptAuthRequest>();
+  const sessionId = request.user?.sid as string | undefined;
+  if (!sessionId || (await this.port.exists(sessionId))) {
+    throw new UnauthorizedException('Invalid access token');
+  }
+
+  return true;
+}
+```
+
+每当一个会话被撤销，它的 `sid` 就会自动加入黑名单，TTL 等于该 access token 的剩余有效期：
+
+```typescript title="src/brkpt-auth/features/blacklist/blacklist.service.ts"
+@OnEvent('brkpt-auth.session.revoke', { suppressErrors: false })
+async handleSessionRevoke({ sessionId }: SessionRevokeEvent) {
+  await this.port.add(
+    sessionId,
+    parseDurationToMs(this.options.jwt.access.expiresIn),
+  );
+}
+```
+
+这会给每个受保护的请求多加一次轻量查询，通常是查 Redis，换来的是立即撤销的能力。
+
+## 载荷结构由你决定
+
+brkpt-auth 从不假设你的 JWT 载荷长什么样，这由 `CoreAdapter` 决定：
+
+```typescript title="src/brkpt-auth/adapters/core.adapter.ts"
+mapUserToJwtPayload(user: User): AuthJwtPayload {
+  return { sub: user.id, email: user.email };
+}
+
+shrinkJwtPayload(payload: AuthJwtPayload): Record<string, unknown> {
+  return { sub: payload.sub };
+}
+```
+
+只要你的适配器能生成和消费它，`AuthJwtPayload` 可以是应用需要的任何结构。
+
+这套设计让你可以从完全无状态起步，只在需要的时候再添加会话管理（列出活跃会话、撤销某一个、撤销除当前会话外的所有会话、立即撤销 access token），而不需要改变登录或路由保护的运作方式。

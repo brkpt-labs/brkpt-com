@@ -1,0 +1,161 @@
+---
+title: 添加 Blacklist
+description: 在 access token 过期之前将其撤销。
+sidebar:
+  order: 4
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+本指南承接添加会话管理，添加 `blacklist` 功能。
+
+撤销会话会使 refresh token 失效，但已经签发的 access token 在过期之前仍然有效。`blacklist` 功能通过拒绝会话已被撤销的 access token 来补上这个空缺。
+
+当一个会话被撤销时，它的会话 id 会被加入黑名单，TTL 使用配置的 access token 有效期。之后每个受 access token 保护的请求都会执行一次轻量的 Redis 查询。
+
+完成本指南后，登出或撤销一个会话，也会阻止相关的 access token 访问受保护路由。
+
+<Aside type="note">
+  `blacklist` 功能和 `session` 功能搭配使用效果最好。如果没有会话撤销，refresh token 可能仍然能够签发新的 access token。
+</Aside>
+
+## 前置条件
+
+- 已完成[添加会话管理](../add-sessions/)的项目
+- 一个正在运行的 Redis 实例
+
+## 添加 blacklist 功能
+
+**添加功能**
+
+运行 CLI 命令：
+
+```bash
+brkpt auth add blacklist
+```
+
+CLI 会添加一个新的 `features/blacklist/` 文件夹。
+
+**实现 `BlacklistAdapter`**
+
+blacklist 适配器只需要存储被撤销的会话 id，并检查某个会话 id 是否在黑名单中。
+
+创建 `blacklist.adapter.ts`，实现基于 Redis 的 blacklist 适配器：
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - blacklist.adapter.ts
+</FileTree>
+
+```typescript title="src/brkpt-auth/adapters/blacklist.adapter.ts"
+import { Inject, Injectable } from '@nestjs/common';
+import { type RedisClientType } from 'redis';
+
+import { BlacklistPort } from '../features/blacklist/blacklist.port';
+
+@Injectable()
+export class BlacklistAdapter implements BlacklistPort {
+  constructor(
+    @Inject('REDIS_CLIENT') private readonly redis: RedisClientType,
+  ) {}
+
+  private key(sessionId: string) {
+    return `blacklist:${sessionId}`;
+  }
+
+  async add(sessionId: string, ttlMs: number): Promise<void> {
+    await this.redis.set(this.key(sessionId), '1', {
+      expiration: { type: 'PX', value: ttlMs },
+    });
+  }
+
+  async exists(sessionId: string): Promise<boolean> {
+    return !!(await this.redis.exists(this.key(sessionId)));
+  }
+}
+```
+
+**注册功能**
+
+更新 `features.ts`，把 `BlacklistAdapter` 传给 `blacklistFeature`：
+
+```typescript title="src/brkpt-auth/features.ts" ins="BlacklistAdapter"
+import { BlacklistAdapter } from './adapters/blacklist.adapter';
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { blacklistFeature } from './features/blacklist/blacklist.feature';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { sessionFeature } from './features/session/session.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  blacklistFeature(BlacklistAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+];
+```
+
+`BlacklistAdapter` 也依赖 `REDIS_CLIENT`。如果你已经完成了添加会话管理，`RedisModule` 应该已经被 `BrkptAuthModule` 导入过了，这里不需要再额外导入。
+
+<Aside type="note">
+  `coreFeature` 和 `blacklistFeature` 都会注册全局守卫，它们的顺序会影响守卫的执行顺序。CLI 添加功能时会更新 `features.ts`，并自动保持所需的守卫顺序。如果你手动编辑 `features.ts`，请保持生成的顺序不变。
+</Aside>
+
+## 运行并验证
+
+启动应用：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+使用开始使用中创建的账号，或者用 `/auth/sign-up` 创建一个新账号。登录并保留返回的 access token。
+
+**登出**
+
+用这个 access token 调用 `/auth/sign-out`：
+
+```http
+POST /auth/sign-out
+Authorization: Bearer <access-token>
+```
+
+**复用该 access token**
+
+用同一个 access token 调用 `/auth/me`：
+
+```http
+GET /auth/me
+Authorization: Bearer <access-token>
+```
+
+这个请求应该被拒绝，因为这个 access token 属于一个已被列入黑名单的会话 id。
+
+<Aside type="tip">
+  验证 blacklist 的一个简单方法是用同一个 access token 连续两次调用 `/auth/sign-out`。没有 `blacklist` 功能时，两次调用可能都会成功；启用 `blacklist` 功能后，第二次调用应该被拒绝。
+</Aside>

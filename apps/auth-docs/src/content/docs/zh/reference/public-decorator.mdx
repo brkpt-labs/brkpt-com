@@ -1,0 +1,48 @@
+---
+title: Public 装饰器
+description: 把路由标记为无需身份验证即可公开访问。
+---
+
+`@Public()` 装饰器把一个路由标记为无需身份验证即可公开访问。
+
+## 装饰器
+
+该装饰器定义在 `src/brkpt-auth/common/decorators/public.decorator.ts` 中：
+
+```typescript title="src/brkpt-auth/common/decorators/public.decorator.ts"
+import { SetMetadata } from '@nestjs/common';
+
+export const IS_PUBLIC_KEY = 'IS_PUBLIC_KEY';
+export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
+```
+
+身份验证守卫会使用这份元数据，跳过对标记了 `@Public()` 的路由的身份验证。
+
+## 用法
+
+把 `@Public()` 应用到任何不需要 access token 就能访问的路由上：
+
+```typescript
+import { Controller, Get } from '@nestjs/common';
+
+import { Public } from './brkpt-auth/common/decorators/public.decorator';
+
+@Controller()
+export class AppController {
+  @Public()
+  @Get('health')
+  health() {
+    return 'OK';
+  }
+}
+```
+
+现在 `/health` 路由可以在不进行身份验证的情况下被访问。
+
+你也可以把 `@Public()` 应用到整个控制器上，让它的所有路由都变为公开：
+
+```typescript
+@Public()
+@Controller('public')
+export class PublicController {}
+```

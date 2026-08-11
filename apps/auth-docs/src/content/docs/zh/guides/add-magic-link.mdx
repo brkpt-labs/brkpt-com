@@ -1,0 +1,321 @@
+---
+title: 添加 Magic Link
+description: 添加基于邮件 magic link 的无密码登录。
+sidebar:
+  order: 7
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+本指南承接[添加 OTP](../add-otp/)，添加 `magic-link` 功能。
+
+`magic-link` 功能让用户可以通过发送到邮箱的链接登录。在本指南中，链接中包含一个一次性令牌，令牌存储在 Redis 中并设置较短的 TTL，使用和其他登录方式相同的用户模型和 JWT 流程。
+
+本指南使用 `email` 作为账号标识符。如果邮箱已存在，就登录该用户；如果不存在，就先创建一个新用户。
+
+## 前置条件
+
+- 已完成[添加 OTP](../add-otp/)的项目
+- 一个正在运行的 Redis 实例
+- 用于发送邮件的 SMTP 凭证
+
+## 添加 magic link 功能
+
+**添加功能**
+
+运行 CLI 命令：
+
+```bash
+brkpt auth add magic-link --driver email
+```
+
+CLI 会添加一个新的 `features/magic-link/` 文件夹，包含所选驱动的文件。
+
+<Aside type="tip">
+  你也可以直接运行 `brkpt auth add magic-link`，在交互式界面中选择驱动。
+</Aside>
+
+**配置 BrkptAuthModule**
+
+在 `BrkptAuthModule.forRootAsync` 中添加 `magicLink` 配置：
+
+```diff lang="typescript" title="src/app.module.ts"
+ BrkptAuthModule.forRootAsync({
+   imports: [ConfigModule],
+   inject: [ConfigService],
+   useFactory: (config: ConfigService) => ({
+     jwt: {
+       // ...
+     },
+     oauth: {
+       // ...
+     },
+     otp: {
+       // ...
+     },
++    magicLink: {
++      expiresIn: '5m',
++      callbackUrls: {
++        authenticate: 'http://localhost:3000/auth/magic-link/authenticate',
++      },
++      emailClient: {
++        host: config.getOrThrow('SMTP_HOST'),
++        port: Number(config.getOrThrow('SMTP_PORT')),
++        user: config.getOrThrow('SMTP_USER'),
++        pass: config.getOrThrow('SMTP_PASS'),
++        from: config.getOrThrow('SMTP_FROM'),
++      },
++    },
+   }),
+ }),
+```
+
+`expiresIn` 控制 magic link 令牌的可用时长。`callbackUrls.authenticate` 是放在登录链接中的 URL。`emailClient` 供 email 驱动用来发送链接。
+
+本指南只需要 `authenticate` 这一个回调 URL。后续基于验证的功能，在把 magic link 用于邮箱验证或重置密码等操作时，可以添加各自的回调 URL。
+
+<Aside type="note">
+  本指南把 `callbackUrls.authenticate` 直接指向后端端点，方便在没有前端的情况下测试整个流程。
+
+  在生产环境中，这个 URL 通常指向一个前端路由。前端从链接中提取令牌，再把它发送给后端的认证端点进行校验。
+</Aside>
+
+**校验 DTO**
+
+magic link 功能使用固定的请求结构。本指南已经启用了 `ValidationPipe`，所以只需为生成的 DTO 添加校验装饰器。
+
+`send.dto.ts` 校验发送链接的请求体：
+
+```diff lang="typescript" title="src/brkpt-auth/features/magic-link/dto/send.dto.ts"
++import { IsString } from 'class-validator';
+
+ export class SendDto {
++  @IsString()
+   target!: string;
+
++  @IsString()
+   method!: string;
+ }
+```
+
+`authenticate.dto.ts` 校验来自 magic link 的查询参数：
+
+```diff lang="typescript" title="src/brkpt-auth/features/magic-link/dto/authenticate.dto.ts"
++import { IsString } from 'class-validator';
+
+ export class AuthenticateDto {
++  @IsString()
+   token!: string;
+ }
+```
+
+**实现 `MagicLinkAdapter`**
+
+magic link 适配器把一次性令牌数据存进 Redis，把保存的 target 映射为 `UserProfile`，并负责查找或创建用户。
+
+创建 `magic-link.adapter.ts`：
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - magic-link.adapter.ts
+</FileTree>
+
+```typescript title="src/brkpt-auth/adapters/magic-link.adapter.ts"
+import { Inject, Injectable } from '@nestjs/common';
+import { type RedisClientType } from 'redis';
+
+import { User } from '../../../generated/prisma/client';
+import { PrismaService } from '../../prisma/prisma.service';
+import { MagicLinkTokenData } from '../common/interfaces';
+import { MagicLinkPort } from '../features/magic-link/magic-link.port';
+import { UserProfile } from './types';
+
+@Injectable()
+export class MagicLinkAdapter implements MagicLinkPort<User, UserProfile> {
+  constructor(
+    @Inject('REDIS_CLIENT')
+    private readonly redis: RedisClientType,
+    private readonly prisma: PrismaService,
+  ) {}
+
+  private key(token: string) {
+    return `magic-link:${token}`;
+  }
+
+  async saveToken(
+    token: string,
+    data: MagicLinkTokenData,
+    ttlMs: number,
+  ): Promise<void> {
+    await this.redis.set(this.key(token), JSON.stringify(data), {
+      expiration: { type: 'PX', value: ttlMs },
+    });
+  }
+
+  async getTokenData(token: string): Promise<MagicLinkTokenData | null> {
+    const data = await this.redis.get(this.key(token));
+    return data ? (JSON.parse(data) as MagicLinkTokenData) : null;
+  }
+
+  async deleteToken(token: string): Promise<void> {
+    await this.redis.del(this.key(token));
+  }
+
+  mapTargetToProfile(method: string, target: string): UserProfile | undefined {
+    switch (method) {
+      case 'email':
+        return { name: '', email: target };
+    }
+  }
+
+  async findOrCreateUserByProfile(
+    profile: UserProfile,
+  ): Promise<{ user: User; created: boolean }> {
+    const existing = await this.prisma.user.findUnique({
+      where: { email: profile.email },
+    });
+    if (existing) {
+      return { user: existing, created: false };
+    }
+
+    const user = await this.prisma.user.create({
+      data: {
+        name: profile.name,
+        email: profile.email,
+        password: '',
+      },
+    });
+
+    return { user, created: true };
+  }
+
+  extractUserIdFromUser(user: User): number {
+    return user.id;
+  }
+}
+```
+
+适配器把每个 magic link 令牌存储为 `magic-link:{token}`。保存的值包含该令牌的 target、method 和 purpose。
+
+对于 `method: "email"`，本指南把保存的邮箱地址映射为 `UserProfile`。如果已经存在使用该邮箱的用户，就用已有的用户数据；如果不存在，会创建一个新用户，`name` 留空，因为 magic link 请求只提供了邮箱地址。你可以为自己的应用调整这个映射逻辑。
+
+<Aside type="note">
+  本指南中，通过 magic link 创建的用户密码字段存的是空字符串。这不代表可以用空密码登录：credentials 登录仍然会用 `bcrypt.compare` 校验提交的密码，而存储的空值并不是空密码的 bcrypt 哈希。后续功能可以让这些用户设置或重置密码，从而也能用邮箱和密码登录。
+</Aside>
+
+**注册功能**
+
+更新 `features.ts`，把 `MagicLinkAdapter` 和 `EmailMagicLinkDriver` 传给 `magicLinkFeature`：
+
+```typescript title="src/brkpt-auth/features.ts" ins="MagicLinkAdapter" ins="EmailMagicLinkDriver"
+import { BlacklistAdapter } from './adapters/blacklist.adapter';
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { MagicLinkAdapter } from './adapters/magic-link.adapter';
+import { OAuthAdapter } from './adapters/oauth.adapter';
+import { OtpAdapter } from './adapters/otp.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { blacklistFeature } from './features/blacklist/blacklist.feature';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { EmailMagicLinkDriver } from './features/magic-link/drivers/email.driver';
+import { magicLinkFeature } from './features/magic-link/magic-link.feature';
+import { GithubOAuthDriver } from './features/oauth/drivers/github.driver';
+import { GoogleOAuthDriver } from './features/oauth/drivers/google.driver';
+import { oauthFeature } from './features/oauth/oauth.feature';
+import { EmailOtpDriver } from './features/otp/drivers/email.driver';
+import { otpFeature } from './features/otp/otp.feature';
+import { sessionFeature } from './features/session/session.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  blacklistFeature(BlacklistAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+  oauthFeature(OAuthAdapter, GoogleOAuthDriver, GithubOAuthDriver),
+  otpFeature(OtpAdapter, EmailOtpDriver),
+  magicLinkFeature(MagicLinkAdapter, EmailMagicLinkDriver),
+];
+```
+
+只有传给 `magicLinkFeature` 的驱动才会被启用。你可以在项目中保留某个驱动文件而不在这里启用它。
+
+## 运行并验证
+
+启动应用：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+`magic-link` 功能新增两个端点：
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/auth/magic-link/send` | 发送一个 magic link |
+| `GET` | `/auth/magic-link/authenticate` | 用 magic link 登录 |
+
+发送端点接收一个 `method` 字段，其值必须匹配一个已启用的 magic link 驱动。在本指南中，`EmailMagicLinkDriver` 使用 `method = 'email'`，所以发送请求体中用 `"method": "email"`。
+
+**发送 magic link**
+
+给某个邮箱地址发送链接：
+
+```http
+POST /auth/magic-link/send
+Content-Type: application/json
+
+{
+  "target": "kevin@example.com",
+  "method": "email"
+}
+```
+
+打开你配置的 SMTP 账号或测试收件箱，邮件内容大致是这样的：
+
+```text
+Subject: Your magic link to sign in
+
+Click the link to continue: http://localhost:3000/auth/magic-link/authenticate?token=<magic-link-token>
+```
+
+<Aside type="tip">
+  email 驱动是你项目里的源代码。要自定义邮件主题或正文，编辑 `features/magic-link/drivers/email.driver.ts` 中的 `send` 方法。
+</Aside>
+
+**用 magic link 登录**
+
+在浏览器中打开链接，或者用 HTTP 客户端发送同样的请求：
+
+```http
+GET /auth/magic-link/authenticate?token=<magic-link-token>
+```
+
+如果邮箱已存在，请求会登录该用户；如果不存在，会先创建一个新用户。两种情况返回的令牌结果和其他登录方式一样。
+
+<Aside type="note">
+  Magic link 令牌会根据 `magicLink.expiresIn` 配置项过期。认证成功后令牌会被删除，同一个链接不能再次使用。
+</Aside>

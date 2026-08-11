@@ -1,0 +1,79 @@
+---
+title: 本地测试 Google OAuth
+description: 获取一个 Google id token，在没有前端的情况下测试 brkpt-auth 的 OAuth 登录。
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+本篇介绍如何从 Google OAuth 2.0 Playground 获取一个真实的 Google `idToken`，并把它发送给添加 OAuth 中的 `oauth` 端点。
+
+当你已经完成[添加 OAuth](../../guides/add-oauth/)，但还没有前端登录页面时，可以用这个方法。
+
+<Aside type="caution">
+  OAuth 令牌和授权码可以用来验证请求身份，测试期间请妥善保管，不要泄露。
+</Aside>
+
+## 前置条件
+
+- 已完成[添加 OAuth](../../guides/add-oauth/)的项目
+- 已在 `.env` 中配置好 Google OAuth client 凭证
+- 一个用于发送测试请求的 HTTP 客户端
+
+## 获取一个 Google id token
+
+打开 [Google OAuth 2.0 Playground](https://developers.google.com/oauthplayground/)。
+
+**选择 scope**
+
+在 Step 1 中，展开 **Google OAuth2 API v2**，选择：
+
+- `https://www.googleapis.com/auth/userinfo.email`
+- `https://www.googleapis.com/auth/userinfo.profile`
+- `openid`
+
+这些 scope 能让返回的 ID token 包含示例适配器所使用的身份字段。
+
+**授权这些 scope**
+
+点击 **Authorize APIs**，选择一个 Google 账号，并同意该请求。
+
+授权完成后，Playground 会跳转回 Step 2，并带有一个授权码。
+
+**用授权码换取令牌**
+
+在 Step 2 中，点击 **Exchange authorization code for tokens**。
+
+响应面板会显示一个包含 `id_token` 字段的 JSON 对象，复制 `id_token` 的值。
+
+<Aside type="note">
+  Google 返回的令牌字段名是 `id_token`。brkpt-auth 的 Google 驱动要求请求体中的字段名是 `idToken`，所以下一步请求时，把这个值粘贴到 `idToken` 字段中。
+</Aside>
+
+## 调用 brkpt-auth 端点
+
+把复制的令牌发送到你本地的 NestJS 服务：
+
+```http
+POST /auth/oauth/google
+Content-Type: application/json
+
+{
+  "idToken": "<google-id-token>"
+}
+```
+
+如果令牌有效，brkpt-auth 会登录匹配的用户，或者先创建一个新用户。两种情况返回的令牌结果和其他登录方式一样。
+
+## 故障排查
+
+**返回的数据不包含 `email` 或 `name`。**
+
+在用授权码换取令牌之前，请确认已经选择了 **Google OAuth2 API v2** 中的 `userinfo.email`、`userinfo.profile` 和 `openid` 这几个 scope。
+
+**请求被判定为无效或已过期。**
+
+从 Playground 重新获取一个新的 `id_token`，ID token 是短期有效的。
+
+**驱动期望的字段名不一样。**
+
+检查你所选驱动的 `verify` 方法。请求体的字段名必须和该方法读取的字段一致。

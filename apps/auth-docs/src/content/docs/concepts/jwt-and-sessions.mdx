@@ -1,0 +1,239 @@
+---
+title: JWT and sessions
+description: How brkpt-auth combines stateless JWT authentication with optional, revocable sessions.
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+brkpt-auth's `core` feature is stateless by default, but it extends into session management without changes to sign-in or route protection. Every sign-in issues tokens carrying a unique session id (`sid`), whether or not the `session` feature is enabled.
+
+## Every sign-in gets a session id
+
+```typescript title="src/brkpt-auth/features/core/core.service.ts"
+async generateTokens(user: unknown, metadata?: RequestMetadata) {
+  const payload = this.port.mapUserToJwtPayload(user);
+  const sessionId = randomUUID();
+
+  const [accessToken, refreshToken] = await Promise.all([
+    this.jwtService.signAsync({
+      ...payload,
+      sid: sessionId,
+    }),
+    this.jwtService.signAsync(
+      {
+        ...(this.port.shrinkJwtPayload?.(payload) ?? payload),
+        sid: sessionId,
+      },
+      {
+        secret: this.options.jwt.refresh.secret,
+        expiresIn: this.options.jwt.refresh.expiresIn,
+      },
+    ),
+  ]);
+
+  await this.eventEmitter.emitAsync('brkpt-auth.session.create', {
+    sessionId,
+    userId: this.port.extractUserIdFromJwtPayload(payload),
+    ttlMs: parseDurationToMs(this.options.jwt.refresh.expiresIn),
+    metadata,
+  } satisfies SessionCreateEvent);
+
+  return { accessToken, refreshToken };
+}
+```
+
+The refresh token uses `shrinkJwtPayload`, if your adapter implements it, to strip fields the access token needs but the refresh token doesn't. If the `session` feature isn't enabled, `sid` is still embedded in both tokens, but nothing reads it. Once `session` is enabled, `brkpt-auth.session.create` is picked up and a session record is created using that same id. See [Events](../events/) for how features pick up events like this one.
+
+## Access tokens: stateless verification
+
+Every route except those marked `@Public()` is protected by a global `JwtGuard`, which verifies only the access token's signature:
+
+```typescript title="src/brkpt-auth/features/core/guards/jwt.guard.ts"
+async canActivate(context: ExecutionContext): Promise<boolean> {
+  const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+    context.getHandler(),
+    context.getClass(),
+  ]);
+  if (isPublic) {
+    return true;
+  }
+
+  const request = context.switchToHttp().getRequest<BrkptAuthRequest>();
+  const token = this.extractToken(request);
+  if (!token) {
+    throw new UnauthorizedException('Invalid access token');
+  }
+
+  try {
+    const payload =
+      await this.jwtService.verifyAsync<Record<string, unknown>>(token);
+    request.user = payload;
+  } catch {
+    throw new UnauthorizedException('Invalid access token');
+  }
+
+  return true;
+}
+```
+
+This check never touches a database: a syntactically valid, unexpired signature is enough. That's the point of stateless JWT, and also its usual limitation: there's no way to revoke a specific access token before it expires.
+
+## Refresh tokens and `JwtRefreshGuard`
+
+The refresh route is protected separately, by `JwtRefreshGuard`, which verifies against the refresh secret and reads the token from a cookie or the request body, depending on configuration:
+
+```typescript title="src/brkpt-auth/features/core/guards/jwt-refresh.guard.ts"
+private extractToken(request: BrkptAuthRequest): string | undefined {
+  switch (this.options.jwt.refresh.transport) {
+    case 'cookie':
+      return request.cookies?.['refreshToken'];
+    case 'body':
+      return (request.body as { refreshToken?: string } | undefined)
+        ?.refreshToken;
+  }
+}
+```
+
+Once verified, `refresh()` issues a new access token. The refresh token itself is left untouched:
+
+```typescript title="src/brkpt-auth/features/core/core.service.ts"
+async refresh(payload: Record<string, unknown>, metadata?: RequestMetadata) {
+  await this.eventEmitter.emitAsync('brkpt-auth.session.validate', {
+    sessionId: payload.sid as string,
+  } satisfies SessionValidateEvent);
+
+  const user = await this.port.findUserByJwtPayload(payload);
+  if (!user) {
+    throw new UnauthorizedException('User not found');
+  }
+
+  const accessToken = await this.jwtService.signAsync({
+    ...this.port.mapUserToJwtPayload(user),
+    sid: payload.sid,
+  });
+
+  void this.eventEmitter.emitAsync('brkpt-auth.session.refresh', {
+    sessionId: payload.sid as string,
+    metadata,
+  } satisfies SessionRefreshEvent);
+
+  return { accessToken };
+}
+```
+
+## Making refresh tokens revocable
+
+`brkpt-auth.session.validate` is where the `session` feature plugs in. With `session` enabled, a listener checks that the session still exists before the refresh proceeds:
+
+```typescript title="src/brkpt-auth/features/session/session.service.ts"
+@OnEvent('brkpt-auth.session.validate', { suppressErrors: false })
+async handleSessionValidate({ sessionId }: SessionValidateEvent) {
+  const exists = await this.port.exists(sessionId);
+  if (!exists) {
+    throw new UnauthorizedException('Session expired or revoked');
+  }
+}
+```
+
+Without the `session` feature, there's no listener for this event, so nothing blocks the refresh, and it behaves exactly like plain stateless JWT. With it enabled, `sid` becomes a handle on the session: you can list every session for a user, revoke one, or revoke all but the current one, and a revoked session's refresh token stops working on its next use.
+
+The same refresh flow also tracks IP and user-agent changes and reports them as anomalies, which the `audit` feature (or your own listener) can act on:
+
+```typescript title="src/brkpt-auth/features/session/session.service.ts"
+@OnEvent('brkpt-auth.session.refresh')
+async handleSessionRefresh({ sessionId, metadata }: SessionRefreshEvent) {
+  const sessionData = await this.port.findById(sessionId);
+  if (!sessionData) return;
+
+  sessionData.lastActiveAt = Date.now();
+
+  if (metadata?.ip && sessionData.metadata.ip !== metadata.ip) {
+    void this.eventEmitter.emitAsync('brkpt-auth.session.anomaly', {
+      sessionId,
+      userId: sessionData.userId,
+      type: 'ip_changed',
+      previous: sessionData.metadata.ip!,
+      current: metadata.ip,
+    } satisfies SessionAnomalyEvent);
+    sessionData.metadata.ip = metadata.ip;
+  }
+
+  // ...the same check runs for user agent changes
+
+  await this.port.update(sessionId, sessionData);
+}
+```
+
+<Aside type="note">
+  Enabling `session` adds one lookup, typically to Redis, on every refresh request. Access-token-protected requests remain fully stateless.
+</Aside>
+
+## Sessions, not token rotation
+
+Sessions are stored in a fast external store like Redis rather than the primary user table, for performance. Refresh tokens are not rotated.
+
+This differs from both the classic server-side `@session` cookie model and the reissue-and-invalidate pattern used by many OAuth-based providers. A persistent session record is the source of truth: both tokens issued at sign-in carry nothing but a pointer to it (`sid`). The session record, not the token, is what gets revoked, inspected, and managed, directly by `sid`.
+
+Refresh token rotation limits the damage from a leaked refresh token: each refresh token can be used once, and using it issues a new one. Reusing an already-used token signals a leak and can trigger revoking the whole chain. The tradeoff: if a leaked token is reused before the legitimate client's next refresh, the system cannot tell attacker from owner, and whichever one refreshes second gets locked out. A grace period is usually added to tolerate concurrent refreshes and flaky networks, which introduces its own edge cases.
+
+None of this applies here. `session.validate` checks the session directly by `sid` on every refresh. The refresh token stays valid for as long as the session does.
+
+If a session looks compromised, revoke it directly by `sid`, or enable `blacklist` to cut off its access token immediately instead of waiting for expiry. `brkpt-auth.session.anomaly` fires when a session's IP or user agent changes mid-lifetime.
+
+## Revoking access tokens immediately
+
+Session revocation invalidates the refresh token, but an access token already issued remains valid until it expires. Revoking a session doesn't retroactively invalidate tokens already handed out. The `blacklist` feature closes this gap with a second global guard:
+
+```typescript title="src/brkpt-auth/features/blacklist/blacklist.guard.ts"
+async canActivate(context: ExecutionContext): Promise<boolean> {
+  const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+    context.getHandler(),
+    context.getClass(),
+  ]);
+  if (isPublic) {
+    return true;
+  }
+
+  const request = context.switchToHttp().getRequest<BrkptAuthRequest>();
+  const sessionId = request.user?.sid as string | undefined;
+  if (!sessionId || (await this.port.exists(sessionId))) {
+    throw new UnauthorizedException('Invalid access token');
+  }
+
+  return true;
+}
+```
+
+Whenever a session is revoked, its `sid` is added to the blacklist automatically, with a TTL equal to the access token's remaining lifetime:
+
+```typescript title="src/brkpt-auth/features/blacklist/blacklist.service.ts"
+@OnEvent('brkpt-auth.session.revoke', { suppressErrors: false })
+async handleSessionRevoke({ sessionId }: SessionRevokeEvent) {
+  await this.port.add(
+    sessionId,
+    parseDurationToMs(this.options.jwt.access.expiresIn),
+  );
+}
+```
+
+This adds one more lightweight lookup, typically Redis, to every protected request, in exchange for immediate revocation.
+
+## The payload shape is yours
+
+brkpt-auth never assumes what your JWT payload looks like. `CoreAdapter` decides:
+
+```typescript title="src/brkpt-auth/adapters/core.adapter.ts"
+mapUserToJwtPayload(user: User): AuthJwtPayload {
+  return { sub: user.id, email: user.email };
+}
+
+shrinkJwtPayload(payload: AuthJwtPayload): Record<string, unknown> {
+  return { sub: payload.sub };
+}
+```
+
+As long as your adapters can produce and consume it, `AuthJwtPayload` can be whatever shape your application needs.
+
+This design lets you start fully stateless and add session management (listing active sessions, revoking one, revoking all but the current one, immediate access-token revocation) only when you need it, without changing how sign-in or route protection works.

@@ -1,0 +1,90 @@
+---
+title: Test GitHub OAuth locally
+description: Get a GitHub authorization code and use it to test brkpt-auth OAuth sign-in without a frontend.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This recipe shows how to get a real GitHub authorization `code` and send it to the `oauth` endpoint from Add OAuth.
+
+Use this when you have finished [Add OAuth](../../guides/add-oauth/) but do not have a frontend sign-in page yet.
+
+<Aside type="caution">
+  OAuth tokens and authorization codes can be used to authenticate requests. Keep them private while testing.
+</Aside>
+
+## Prerequisites
+
+- A project completed from [Add OAuth](../../guides/add-oauth/)
+- GitHub OAuth client credentials configured in `.env`
+- An HTTP client for sending the test request
+
+## Create a GitHub OAuth app
+
+For a simple "Sign in with GitHub" flow, create a GitHub OAuth app. A GitHub App is not required unless your application needs GitHub App-specific permissions or repository integration.
+
+Follow GitHub's [Creating an OAuth app](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app) guide.
+
+For local testing without a frontend, you can use:
+
+```text
+Homepage URL: http://localhost:3000
+Authorization callback URL: http://localhost:3000/callback
+```
+
+The callback page does not need to exist for this recipe. If your browser shows a 404 response after redirecting to `/callback`, that is fine. Copy the `code` query parameter from the address bar.
+
+## Get a GitHub authorization code
+
+Build an authorization URL with your GitHub OAuth app client ID:
+
+```text
+https://github.com/login/oauth/authorize?client_id=<github-client-id>&scope=read:user%20user:email
+```
+
+Replace `<github-client-id>` with the same value you use for `GITHUB_CLIENT_ID`.
+
+Open the URL in your browser and authorize the app.
+
+GitHub redirects to your callback URL:
+
+```text
+http://localhost:3000/callback?code=<github-code>
+```
+
+Copy the `code` value from the address bar.
+
+<Aside type="note">
+  The `code` is short-lived and can be used only once. If the request fails because the code is expired or already used, repeat the authorization flow and copy a fresh code.
+</Aside>
+
+## Call the brkpt-auth endpoint
+
+Send the copied code to your local NestJS server:
+
+```http
+POST /auth/oauth/github
+Content-Type: application/json
+
+{
+  "code": "<github-code>"
+}
+```
+
+The GitHub driver exchanges the code for a GitHub access token, fetches the GitHub user profile, and returns the verified provider payload to brkpt-auth.
+
+If the email already exists, the request signs in that user. If it does not exist, a new user is created first. Both cases return the same token result as the other sign-in methods.
+
+## Troubleshooting
+
+**The request is rejected as invalid or expired.**
+
+Get a fresh `code` by opening the authorization URL again. GitHub authorization codes are short-lived and single-use.
+
+**The GitHub profile does not include an email address.**
+
+GitHub may return `email: null` when the user keeps their email private. The example adapter from Add OAuth rejects those profiles because the user model requires an email. For local testing, use an account with a public email or fetch the user's primary verified email in your GitHub flow.
+
+**The driver expects a different field name.**
+
+Check the `verify` method in your selected driver. The request body field must match what that method reads.

@@ -1,0 +1,223 @@
+---
+title: Use TypeORM
+description: Replace the in-memory user repository with TypeORM and PostgreSQL.
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This recipe shows using TypeORM instead of the Prisma setup from [Use Prisma](../../guides/use-prisma/). Use this if TypeORM is your ORM of choice.
+
+Only `CoreAdapter` and `CredentialsAdapter` change. Nothing else in `brkpt-auth/` is affected.
+
+## Prerequisites
+
+- A project completed from [Get started](../../guides/get-started/)
+- A PostgreSQL database
+
+## Install TypeORM
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add @nestjs/typeorm typeorm pg
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install @nestjs/typeorm typeorm pg
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn add @nestjs/typeorm typeorm pg
+```
+
+  </TabItem>
+</Tabs>
+
+## Configure the database connection
+
+Add `DATABASE_URL` to your existing `.env` file:
+
+```bash title=".env"
+DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/DB_NAME?schema=public"
+```
+
+## Define the entity
+
+<FileTree>
+- src/
+  - user/
+    - user.entity.ts
+    - user.module.ts
+</FileTree>
+
+```typescript title="src/user/user.entity.ts"
+import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
+
+@Entity()
+export class User {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column()
+  name!: string;
+
+  @Column({ unique: true })
+  email!: string;
+
+  @Column()
+  password!: string;
+}
+```
+
+brkpt-auth does not require this exact entity shape. Your adapters decide which columns are used for JWT payloads, password validation, and safe user responses.
+
+```typescript title="src/user/user.module.ts"
+import { Module } from '@nestjs/common';
+import { TypeOrmModule } from '@nestjs/typeorm';
+
+import { User } from './user.entity';
+
+@Module({
+  imports: [TypeOrmModule.forFeature([User])],
+  exports: [TypeOrmModule],
+})
+export class UserModule {}
+```
+
+## Register `TypeOrmModule`
+
+```typescript title="src/app.module.ts"
+import { Module } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { TypeOrmModule } from '@nestjs/typeorm';
+
+import { User } from './user/user.entity';
+import { UserModule } from './user/user.module';
+// ...existing brkpt-auth imports
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
+    TypeOrmModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        type: 'postgres',
+        url: config.getOrThrow('DATABASE_URL'),
+        entities: [User],
+        synchronize: true,
+      }),
+    }),
+    UserModule,
+    // ...existing BrkptAuthModule.forRootAsync
+  ],
+})
+export class AppModule {}
+```
+
+<Aside type="caution">
+  `synchronize: true` auto-generates your schema from entities and is convenient for local development. Do not use it in production. Use TypeORM migrations instead.
+</Aside>
+
+## Rewrite `CoreAdapter`
+
+```typescript title="src/brkpt-auth/adapters/core.adapter.ts"
+import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+
+import { User } from '../../user/user.entity';
+import { CorePort } from '../features/core/core.port';
+import { AuthJwtPayload } from './types';
+
+@Injectable()
+export class CoreAdapter implements CorePort<User> {
+  constructor(
+    @InjectRepository(User) private readonly userRepo: Repository<User>,
+  ) {}
+
+  mapUserToJwtPayload(user: User): AuthJwtPayload {
+    return {
+      sub: user.id,
+      email: user.email,
+    };
+  }
+
+  shrinkJwtPayload(payload: AuthJwtPayload): Record<string, unknown> {
+    return {
+      sub: payload.sub,
+    };
+  }
+
+  findUserByJwtPayload(payload: AuthJwtPayload): Promise<User | null> {
+    return this.userRepo.findOneBy({ id: payload.sub });
+  }
+
+  toSafeUser(user: User): Record<string, unknown> {
+    const { password: _password, ...safe } = user;
+    return safe;
+  }
+
+  extractUserIdFromJwtPayload(payload: AuthJwtPayload): number {
+    return payload.sub;
+  }
+}
+```
+
+## Rewrite `CredentialsAdapter`
+
+```typescript title="src/brkpt-auth/adapters/credentials.adapter.ts"
+import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import * as bcrypt from 'bcrypt';
+import { Repository } from 'typeorm';
+
+import { User } from '../../user/user.entity';
+import { CredentialsPort } from '../features/credentials/credentials.port';
+import { SignInDto } from '../features/credentials/dto/sign-in.dto';
+import { SignUpDto } from '../features/credentials/dto/sign-up.dto';
+
+@Injectable()
+export class CredentialsAdapter implements CredentialsPort<User> {
+  constructor(
+    @InjectRepository(User) private readonly userRepo: Repository<User>,
+  ) {}
+
+  findUserByDto(dto: SignInDto | SignUpDto): Promise<User | null> {
+    return this.userRepo.findOneBy({ email: dto.email });
+  }
+
+  validatePassword(user: User, dto: SignInDto): Promise<boolean> {
+    return bcrypt.compare(dto.password, user.password);
+  }
+
+  async createUser(dto: SignUpDto): Promise<User> {
+    const password = await bcrypt.hash(dto.password, 10);
+    const user = this.userRepo.create({
+      name: dto.name,
+      email: dto.email,
+      password,
+    });
+    return this.userRepo.save(user);
+  }
+
+  extractUserIdFromUser(user: User): number {
+    return user.id;
+  }
+}
+```
+
+## Update `brkpt-auth.module.ts`
+
+`UserModule` now exports `TypeOrmModule` instead of an in-memory repository, so no change is needed there. `brkpt-auth.module.ts` already imports `UserModule` from Get started.
+
+## Run and verify
+
+Start the application and sign up through `/auth/sign-up` as in Get started. The created user is now stored in PostgreSQL through TypeORM, and survives a server restart.

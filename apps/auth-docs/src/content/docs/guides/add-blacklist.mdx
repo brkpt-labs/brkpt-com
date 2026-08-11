@@ -1,0 +1,161 @@
+---
+title: Add blacklist
+description: Revoke access tokens before they expire.
+sidebar:
+  order: 4
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This guide continues from Add sessions and adds the `blacklist` feature.
+
+Session revocation invalidates refresh tokens, but existing access tokens remain valid until they expire. The `blacklist` feature closes that gap by rejecting access tokens whose session has been revoked.
+
+When a session is revoked, its session id is added to the blacklist using the configured access-token lifetime as the TTL. Access-token protected requests then perform one lightweight Redis lookup.
+
+By the end of this guide, signing out or revoking a session will also prevent the related access token from accessing protected routes.
+
+<Aside type="note">
+  The `blacklist` feature is most useful together with the `session` feature. Without session revocation, a refresh token may still be able to issue a new access token.
+</Aside>
+
+## Prerequisites
+
+- A project completed from [Add sessions](../add-sessions/)
+- A running Redis instance
+
+## Add the blacklist feature
+
+**Add the feature**
+
+Run the CLI command:
+
+```bash
+brkpt auth add blacklist
+```
+
+The CLI adds a new `features/blacklist/` folder.
+
+**Implement `BlacklistAdapter`**
+
+The blacklist adapter only needs to store revoked session ids and check whether a session id is blacklisted.
+
+Create `blacklist.adapter.ts` and implement the Redis-backed blacklist adapter:
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - blacklist.adapter.ts
+</FileTree>
+
+```typescript title="src/brkpt-auth/adapters/blacklist.adapter.ts"
+import { Inject, Injectable } from '@nestjs/common';
+import { type RedisClientType } from 'redis';
+
+import { BlacklistPort } from '../features/blacklist/blacklist.port';
+
+@Injectable()
+export class BlacklistAdapter implements BlacklistPort {
+  constructor(
+    @Inject('REDIS_CLIENT') private readonly redis: RedisClientType,
+  ) {}
+
+  private key(sessionId: string) {
+    return `blacklist:${sessionId}`;
+  }
+
+  async add(sessionId: string, ttlMs: number): Promise<void> {
+    await this.redis.set(this.key(sessionId), '1', {
+      expiration: { type: 'PX', value: ttlMs },
+    });
+  }
+
+  async exists(sessionId: string): Promise<boolean> {
+    return !!(await this.redis.exists(this.key(sessionId)));
+  }
+}
+```
+
+**Register the feature**
+
+Update `features.ts` and pass `BlacklistAdapter` to `blacklistFeature`:
+
+```typescript title="src/brkpt-auth/features.ts" ins="BlacklistAdapter"
+import { BlacklistAdapter } from './adapters/blacklist.adapter';
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { blacklistFeature } from './features/blacklist/blacklist.feature';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { sessionFeature } from './features/session/session.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  blacklistFeature(BlacklistAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+];
+```
+
+`BlacklistAdapter` also depends on `REDIS_CLIENT`. If you completed Add sessions, `RedisModule` is already imported by `BrkptAuthModule`, so no module import is needed here.
+
+<Aside type="note">
+  `coreFeature` and `blacklistFeature` both register global guards. Their order affects guard execution. When the CLI adds a feature, it updates `features.ts` and automatically preserves the required guard order. If you edit `features.ts` manually, keep the generated order.
+</Aside>
+
+## Run and verify
+
+Start the application:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+Use an existing account from Get started, or create a new one with `/auth/sign-up`. Sign in and keep the returned access token.
+
+**Sign out**
+
+Call `/auth/sign-out` with that access token:
+
+```http
+POST /auth/sign-out
+Authorization: Bearer <access-token>
+```
+
+**Reuse the access token**
+
+Call `/auth/me` with the same access token:
+
+```http
+GET /auth/me
+Authorization: Bearer <access-token>
+```
+
+The request should be rejected because the access token belongs to a blacklisted session id.
+
+<Aside type="tip">
+  A quick way to verify the blacklist is to call `/auth/sign-out` twice with the same access token. Without the `blacklist` feature, both calls may succeed. With the `blacklist` feature enabled, the second call should be rejected.
+</Aside>

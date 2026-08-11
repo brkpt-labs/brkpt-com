@@ -1,0 +1,9 @@
+{
+  "name": "brkpt-com",
+  "private": true,
+  "scripts": {
+    "dev:auth": "pnpm --filter auth-docs dev",
+    "build:auth": "pnpm --filter auth-docs build",
+    "preview:auth": "pnpm --filter auth-docs preview"
+  }
+}

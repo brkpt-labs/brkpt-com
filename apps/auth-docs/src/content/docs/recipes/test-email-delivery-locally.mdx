@@ -1,0 +1,78 @@
+---
+title: Test email delivery locally
+description: Use a test SMTP inbox to receive brkpt-auth emails during local development.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This recipe shows how to create a test SMTP inbox and use it to receive emails sent by brkpt-auth during local development.
+
+Use this when a feature needs email delivery but you do not want to configure a real email provider yet.
+
+## Create a test SMTP account
+
+Open Ethereal and create a test account:
+
+```text
+https://ethereal.email/create
+```
+
+Ethereal gives you SMTP credentials and a web inbox for captured test emails.
+
+<Aside type="caution">
+  Ethereal shows the generated credentials only once. Copy them before leaving the page.
+</Aside>
+
+## Configure SMTP variables
+
+Copy the generated SMTP credentials into your existing `.env` file:
+
+```bash title=".env"
+SMTP_HOST="smtp.ethereal.email"
+SMTP_PORT="587"
+SMTP_USER="your-ethereal-username"
+SMTP_PASS="your-ethereal-password"
+SMTP_FROM="no-reply@example.test"
+```
+
+Restart the NestJS server after changing `.env`.
+
+## Send a test email
+
+Trigger a brkpt-auth feature that sends email.
+
+For example, if you completed [Add OTP](../../guides/add-otp/), send an OTP code:
+
+```http
+POST /auth/otp/send
+Content-Type: application/json
+
+{
+  "target": "kevin@example.com",
+  "method": "email"
+}
+```
+
+## Open the inbox
+
+Open the Ethereal messages page:
+
+```text
+https://ethereal.email/messages
+```
+
+Find the captured message and copy the verification value you need, such as an OTP code or a magic link.
+
+## Troubleshooting
+
+**No message appears in the inbox.**
+
+Make sure the SMTP variables match the Ethereal account you created. Then restart the NestJS server and trigger the email flow again.
+
+**The SMTP credentials are missing.**
+
+Ethereal shows generated credentials only once. Create a new Ethereal account and update your `.env` file.
+
+**The message format is not what you want.**
+
+The email driver is source code in your project. Edit the relevant driver `send` method to customize the subject or body.

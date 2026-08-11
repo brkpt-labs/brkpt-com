@@ -1,0 +1,196 @@
+---
+title: 验证策略
+description: otp 和 magic-link 如何既作为登录方式，又作为其他功能的验证策略使用。
+sidebar:
+  order: 4
+---
+
+`otp` 和 `magic-link` 这样的功能不只是登录方式。`reset-password` 和 `verify-email` 需要的是同一种底层能力：证明用户掌控着某个邮箱、手机号或其他标识符。与其各自重新实现一遍验证码生成、发送和存储，它们复用 `otp` 和 `magic-link` 作为可插拔的验证策略。
+
+## 监听验证请求
+
+每个具备验证能力的功能，其 service 都会监听两个通用事件，只有当请求中的 `strategy` 与自己的名字匹配时才会响应。以 `otp` 为例：
+
+```typescript title="src/brkpt-auth/features/otp/otp.service.ts"
+@OnEvent('brkpt-auth.verification.send', { suppressErrors: false })
+async handleVerificationSend({
+  target,
+  strategy,
+  method,
+  purpose,
+}: VerificationSendEvent) {
+  if (strategy !== 'otp') {
+    return;
+  }
+  await this.send(target, method, purpose);
+  return true;
+}
+
+@OnEvent('brkpt-auth.verification.verify', { suppressErrors: false })
+async handleVerificationVerify({
+  target,
+  strategy,
+  purpose,
+  proof,
+}: VerificationVerifyEvent): Promise<VerificationVerifyResult | undefined> {
+  if (strategy !== 'otp') {
+    return;
+  }
+
+  if (!target) {
+    throw new BadRequestException('Target is required for OTP verification');
+  }
+
+  const data = await this.port.getCodeData(target);
+  if (!data || data.code !== proof || data.purpose !== purpose) {
+    throw new UnauthorizedException('Invalid or expired OTP code');
+  }
+
+  await this.port.deleteCode(target);
+
+  return { target, method: data.method };
+}
+```
+
+`magic-link` 实现了相同的两个处理器，只是用 `strategy !== 'magic-link'` 做过滤。`brkpt-auth.verification.send` 和 `brkpt-auth.verification.verify` 都是命令（见[事件](../events/)）。由于多个验证功能可能同时启用，同一个事件可能被不止一个监听器收到，只有 `strategy` 匹配的那一个会真正处理它。
+
+## 消费一个验证策略
+
+像 `reset-password` 这样的功能并不知道、也不关心当前启用了哪些验证功能。它只负责发出这个通用事件，然后检查返回结果：
+
+```typescript title="src/brkpt-auth/features/reset-password/reset-password.service.ts"
+async send(target: string, strategy: string, method: string) {
+  const user = await this.port.findUserByTarget(method, target);
+  if (!user) {
+    throw new UnauthorizedException('User not found');
+  }
+
+  const results = await this.eventEmitter.emitAsync(
+    'brkpt-auth.verification.send',
+    {
+      target,
+      strategy,
+      method,
+      purpose: 'resetPassword',
+    } satisfies VerificationSendEvent,
+  );
+  if (!results.some((r) => r === true)) {
+    throw new BadRequestException(
+      `Unsupported verification strategy: ${strategy}`,
+    );
+  }
+}
+
+async reset(
+  strategy: string,
+  proof: string,
+  newPassword: string,
+  target?: string,
+  metadata?: RequestMetadata,
+) {
+  const results = await this.eventEmitter.emitAsync(
+    'brkpt-auth.verification.verify',
+    { target, strategy, purpose: 'resetPassword', proof } satisfies VerificationVerifyEvent,
+  );
+
+  const verification = results.find(
+    (result): result is VerificationVerifyResult => result != null,
+  );
+  if (!verification) {
+    throw new BadRequestException(
+      `Unsupported verification strategy: ${strategy}`,
+    );
+  }
+
+  const user = await this.port.findUserByTarget(
+    verification.method,
+    verification.target,
+  );
+  if (!user) {
+    throw new UnauthorizedException('User not found');
+  }
+
+  await this.port.updatePassword(user, newPassword);
+
+  void this.eventEmitter.emitAsync('brkpt-auth.session.revoke-others', {
+    sessionId: '',
+    userId: this.port.extractUserIdFromUser(user),
+  } satisfies SessionRevokeOthersEvent);
+
+  void this.eventEmitter.emitAsync('brkpt-auth.reset-password.reset', {
+    userId: this.port.extractUserIdFromUser(user),
+    timestamp: Date.now(),
+    metadata,
+  } satisfies ResetPasswordEvent);
+}
+```
+
+`emitAsync` 会把每个监听器的返回值收集成一个数组返回。`send` 检查是否*任意*一个监听器返回了成功（`true`）；`reset` 则查找第一个不为空的 `VerificationVerifyResult`。如果请求的 `strategy` 没有匹配到任何已启用的功能，每个监听器都会提前返回 `undefined`，`reset-password` 就会报告这是一个不支持的策略，而不需要知道 `otp` 或 `magic-link` 是否存在。
+
+重置成功后，`reset-password` 还会通过 `brkpt-auth.session.revoke-others` 撤销该用户的其他所有会话，并把重置本身作为一个领域事件上报，供 `audit` 监听。
+
+## purpose 让验证数据保持在各自的作用域内
+
+因为同一个 `otp` 验证码或 `magic-link` 令牌可能因不同原因被请求，存储的数据除了凭证本身，总是附带一个 `purpose`：
+
+```typescript title="src/brkpt-auth/common/interfaces/index.ts"
+export interface OtpCodeData {
+  code: string;
+  method: string;
+  purpose: VerificationPurpose;
+}
+
+export interface MagicLinkTokenData {
+  target: string;
+  method: string;
+  purpose: VerificationPurpose;
+}
+
+export type VerificationPurpose =
+  | 'authenticate'
+  | 'verifyEmail'
+  | 'resetPassword';
+
+export interface VerificationSendEvent {
+  target: string;
+  strategy: string;
+  method: string;
+  purpose: VerificationPurpose;
+}
+
+export interface VerificationVerifyEvent {
+  target?: string;
+  strategy: string;
+  purpose: VerificationPurpose;
+  proof: string;
+}
+
+export interface VerificationVerifyResult {
+  target: string;
+  method: string;
+}
+```
+
+上面 `handleVerificationVerify` 中，为 `resetPassword` 发送的验证码会被检查 `purpose === 'resetPassword'`，所以它不能被拿去用于登录。`VerificationVerifyEvent` 上的 `target` 是可选的，因为不是每种策略都需要提前提供它：`otp` 需要 `target` 来查找存储的验证码，而 `magic-link` 可以直接从令牌本身还原出 target。
+
+## authenticate 是默认的 purpose
+
+当 `otp` 或 `magic-link` 被直接用于登录，而不是通过上面的通用验证事件时，它会把 `purpose` 默认设为 `'authenticate'`，并直接与 `CoreService` 通信，而不经过 `reset-password` 或 `verify-email`：
+
+```typescript title="src/brkpt-auth/features/otp/otp.service.ts"
+async authenticate(target: string, code: string, metadata?: RequestMetadata) {
+  const data = await this.port.getCodeData(target);
+  if (!data || data.code !== code || data.purpose !== 'authenticate') {
+    throw new UnauthorizedException('Invalid or expired OTP code');
+  }
+
+  await this.port.deleteCode(target);
+
+  const profile = this.port.mapTargetToProfile(data.method, target);
+  // ...根据 `profile` 查找或创建用户
+
+  return this.coreService.generateTokens(user, metadata);
+}
+```
+
+这就是为什么 `otp` 和 `magic-link` 都实现了两条独立路径：各自用于登录的 `authenticate()` 方法，以及用于其他所有场景的 `verification.send` / `verification.verify` 监听器。两条路径调用的是同一套底层发送、存储和校验逻辑，只是 `purpose` 不同，结果的去向也不同。

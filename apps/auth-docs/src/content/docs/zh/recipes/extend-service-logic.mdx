@@ -1,0 +1,115 @@
+---
+title: 扩展 Service 逻辑
+description: 当端口不够用时，直接编辑安装的源代码。
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+brkpt-auth 中大多数定制都是通过适配器完成的：换一种方式查找、校验或存储用户。但有时你需要的不是换一种映射数据的方式，而是要改变流程本身。因为一个功能的 `*.service.ts` 是直接安装进你项目的源代码，而不是编译后的包，直接编辑它是官方支持的做法。
+
+本篇给 `credentials` 添加登录失败次数锁定功能，这是任何适配器方法组合都无法表达的需求，因为它改变的是 `validatePassword` 何时被调用这件事本身。
+
+## 前置条件
+
+- 已完成[开始使用](../../guides/get-started/)的项目
+- 一个正在运行的 Redis 实例，或者其他可以存放短期计数器的存储
+
+## 找到目标方法
+
+打开 `src/brkpt-auth/features/credentials/credentials.service.ts`，`signIn` 是这样的：
+
+```typescript title="src/brkpt-auth/features/credentials/credentials.service.ts"
+async signIn(dto: unknown, metadata?: RequestMetadata) {
+  const user = await this.port.findUserByDto(dto);
+  if (!user) {
+    throw new UnauthorizedException('Invalid credentials');
+  }
+
+  const isValid = await this.port.validatePassword(user, dto);
+  if (!isValid) {
+    throw new UnauthorizedException('Invalid credentials');
+  }
+
+  void this.eventEmitter.emitAsync('brkpt-auth.credentials.sign-in', {
+    userId: this.port.extractUserIdFromUser(user),
+    feature: 'credentials',
+    timestamp: Date.now(),
+    metadata,
+  } satisfies SignInEvent);
+
+  return this.coreService.generateTokens(user, metadata);
+}
+```
+
+文件顶部已经导入了 `Inject` 和 `UnauthorizedException`（构造函数中已经用到了 `@Inject(BRKPT_AUTH_CREDENTIALS_PORT)`），所以实现锁定功能只需要一个新的导入。
+
+## 添加锁定逻辑
+
+注入一个用于存储尝试次数的存储，并在校验密码之前先检查它：
+
+```diff lang="typescript" title="src/brkpt-auth/features/credentials/credentials.service.ts"
++import { type RedisClientType } from 'redis';
+
+ @Injectable()
+ export class CredentialsService {
+   constructor(
+     @Inject(BRKPT_AUTH_CREDENTIALS_PORT)
+     private readonly port: CredentialsPort,
+     private readonly coreService: CoreService,
+     private readonly eventEmitter: EventEmitter2,
++    @Inject('REDIS_CLIENT')
++    private readonly redis: RedisClientType,
+   ) {}
+
++  private readonly maxAttempts = 5;
++  private readonly lockoutSeconds = 15 * 60;
+
+   async signIn(dto: unknown, metadata?: RequestMetadata) {
+     const user = await this.port.findUserByDto(dto);
+     if (!user) {
+       throw new UnauthorizedException('Invalid credentials');
+     }
+
++    const userId = this.port.extractUserIdFromUser(user);
++    const key = `login-attempts:${userId}`;
++    const attempts = Number((await this.redis.get(key)) ?? 0);
++    if (attempts >= this.maxAttempts) {
++      throw new UnauthorizedException(
++        'Too many failed attempts. Try again later.',
++      );
++    }
+
+     const isValid = await this.port.validatePassword(user, dto);
+     if (!isValid) {
++      await this.redis
++        .multi()
++        .incr(key)
++        .expire(key, this.lockoutSeconds)
++        .exec();
+       throw new UnauthorizedException('Invalid credentials');
+     }
+
++    await this.redis.del(key);
+
+     void this.eventEmitter.emitAsync('brkpt-auth.credentials.sign-in', {
+-      userId: this.port.extractUserIdFromUser(user),
++      userId,
+       feature: 'credentials',
+       timestamp: Date.now(),
+       metadata,
+     } satisfies SignInEvent);
+
+     return this.coreService.generateTokens(user, metadata);
+   }
+ }
+```
+
+计数器在每次密码校验失败时递增，成功时清零，键本身会在 `lockoutSeconds` 之后过期，锁定状态会自动解除。同样安装在你项目中的 `credentials.service.spec.ts`，是给这个改动加测试的合适位置。
+
+## 为什么这应该放在 service 而不是适配器里
+
+`CredentialsPort` 只定义了如何查找用户、校验密码、创建用户和提取 id：这些都是数据操作，不涉及控制流。而锁定逻辑需要在 `validatePassword` 被调用*之前*就运行，还需要自己的状态（尝试次数计数器），这不属于用户模型的一部分。这两点都无法用端口方法的签名来表达。因为 `credentials.service.ts` 不是从某个包里拉取的依赖，这里不存在需要绕过的抽象层。你可以直接编辑这段流程，就像编辑你拥有的任何其他文件一样。
+
+<Aside type="note">
+  由于再次为同一个功能运行 `brkpt auth add` 时，CLI 可能会覆盖已安装的文件，请记录下这类改动（写注释、写变更日志，或者单独提交），这样一旦重新生成该功能，就能方便地重新应用这些改动。
+</Aside>

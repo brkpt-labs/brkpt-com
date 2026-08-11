@@ -1,0 +1,250 @@
+---
+title: brkpt-auth
+description: Transparent, composable, portable, hexagonal authentication for NestJS.
+template: splash
+
+hero:
+  tagline: Build authentication for NestJS with source code you own. Transparent, composable, portable, and hexagonal by design.
+  announcement:
+    text: v0.1.0 is now available
+    link: https://github.com/brkpt-labs/brkpt-auth
+  actions:
+    - text: Get Started
+      link: /auth/guides/get-started/
+    - text: Source Code
+      link: https://github.com/brkpt-labs/brkpt-auth
+      variant: minimal
+---
+
+import { Card, CardGrid, Steps } from "@astrojs/starlight/components";
+import { ContainerSection } from "lucode-starlight/components";
+
+<div class="auth-splash">
+
+<ContainerSection>
+
+## Every approach has a cost
+
+<CardGrid>
+  <Card title="Managed services" icon="cloud-download">
+    A black box in the cloud. Limited customization and vendor lock-in.
+  </Card>
+
+  <Card title="Self-hosted libraries" icon="server">
+    A black box on your own machine. Heavy abstractions make customization difficult.
+  </Card>
+
+  <Card title="Auth boilerplates" icon="code-branch">
+    Full source code with strong architectural opinions that often require significant rework.
+  </Card>
+
+  <Card title="Rolling your own" icon="pencil">
+    Complete control, but every project starts from the same foundation again.
+  </Card>
+</CardGrid>
+
+</ContainerSection>
+
+<ContainerSection>
+
+## Why brkpt-auth
+
+<CardGrid>
+  <Card title="Transparent" icon="document">
+    Full source code installed directly into your project. No compiled packages, no hidden behavior, and a structure that is easy to inspect and modify.
+  </Card>
+
+  <Card title="Composable" icon="puzzle">
+    Add only what you need. Independent features communicate through events with loose coupling.
+  </Card>
+
+  <Card title="Non-invasive" icon="padlock">
+    No assumptions about your database schema, user model, or JWT payload. Implement the required ports and integrate without restructuring your application.
+  </Card>
+
+  <Card title="Portable" icon="random">
+    Business logic stays independent from adapters. Move the authentication logic into another project and replace only the adapters.
+  </Card>
+
+  <Card title="NestJS Native" icon="approve-check-circle">
+    Built around NestJS modules, dependency injection, guards, decorators, and providers from the beginning.
+  </Card>
+
+  <Card title="Hexagonal" icon="setting">
+    A clear boundary that services contain business logic, ports define contracts, and adapters remain fully under your control.
+  </Card>
+</CardGrid>
+
+</ContainerSection>
+
+<ContainerSection>
+
+## How does it work
+
+brkpt-auth separates stable authentication logic from project-specific implementation. Authentication capabilities are organized as independent features, while adapters connect those features to your own application.
+
+Each feature is added to the project, connected through an adapter, and registered through `BrkptAuthModule`. Whether you enable credentials, OAuth, sessions, blacklist, or any other capability, the integration pattern remains the same.
+
+Features communicate through events instead of direct dependencies, allowing new capabilities to be added without modifying existing ones. Features that are not added simply don't participate in `BrkptAuthModule`.
+
+Ports and adapters keep infrastructure outside of the authentication core. Your database schema, user model, password strategy, JWT payload, validation rules, and external services remain under your control. Migrating to another project usually means replacing adapters instead of rewriting authentication logic.
+
+Session management is built on top of stateless JWT instead of replacing it. Stateful capabilities such as session management and token revocation can be added incrementally without changing the core authentication flow.
+
+**brkpt-cli** helps assemble this structure by installing source code directly into your project and wiring new features into the same architecture.
+
+</ContainerSection>
+
+<ContainerSection>
+
+## Is it hard to integrate
+
+Each feature follows the same integration flow: add the feature, implement its adapter, and register it.
+
+<Steps>
+
+1. ### Add a feature
+
+   Use **brkpt-cli** to add the feature source code to your project.
+
+   ```bash title="Add credentials"
+   brkpt auth add credentials
+   ```
+
+2. ### Implement the adapter
+
+   Connect the feature port to your existing application code. Most adapter methods are simple field mappings or direct service calls.
+
+   ```typescript "CredentialsAdapter"
+   // credentials.adapter.ts
+   @Injectable()
+   export class CredentialsAdapter implements CredentialsPort<User> {
+     constructor(private readonly prisma: PrismaService) {}
+
+     findUserByDto(dto: SignInDto | SignUpDto): Promise<User | null> {
+       return this.prisma.user.findUnique({ where: { email: dto.email } });
+     }
+
+     validatePassword(user: User, dto: SignInDto): Promise<boolean> {
+       return bcrypt.compare(dto.password, user.password);
+     }
+
+     async createUser(dto: SignUpDto): Promise<User> {
+       const password = await bcrypt.hash(dto.password, 10);
+       return this.prisma.user.create({
+         data: { email: dto.email, password },
+       });
+     }
+
+     extractUserIdFromUser(user: User): number {
+       return user.id;
+     }
+   }
+   ```
+
+3. ### Register the feature
+
+   **brkpt-cli** updates `features.ts` for you. After implementing the adapter, pass it to the corresponding feature in the generated feature list.
+
+   ```typescript ins="CredentialsAdapter"
+   // src/brkpt-auth/features.ts
+   export const features: FeatureConfig[] = [
+     coreFeature(CoreAdapter),
+     credentialsFeature(CredentialsAdapter),
+   ];
+   ```
+
+</Steps>
+
+That's it. Once `BrkptAuthModule` is registered in your `AppModule`, added features become part of the same NestJS authentication flow.
+
+Depending on the feature, you may still need normal project setup such as dependencies, environment variables, DTOs, or infrastructure modules.
+
+</ContainerSection>
+
+<ContainerSection>
+
+## Available features
+
+brkpt-auth organizes common authentication capabilities as independent features. Start with `core`, then add only the features your application needs.
+
+<div class="auth-feature-stack">
+  <section class="auth-feature-group auth-feature-group--foundation">
+    <h3>Foundation</h3>
+    <ul>
+      <li><code class="feature-badge feature-badge--core">core</code></li>
+    </ul>
+  </section>
+
+  <section class="auth-feature-group auth-feature-group--signin">
+    <h3>Sign-in methods</h3>
+    <ul>
+      <li><code class="feature-badge feature-badge--credentials">credentials</code></li>
+      <li><code class="feature-badge feature-badge--oauth">oauth</code></li>
+      <li><code class="feature-badge feature-badge--otp">otp</code></li>
+      <li><code class="feature-badge feature-badge--magic">magic-link</code></li>
+    </ul>
+  </section>
+
+  <section class="auth-feature-group auth-feature-group--token">
+    <h3>Session management</h3>
+    <ul>
+      <li><code class="feature-badge feature-badge--session">session</code></li>
+      <li><code class="feature-badge feature-badge--blacklist">blacklist</code></li>
+    </ul>
+  </section>
+
+  <section class="auth-feature-group auth-feature-group--security">
+    <h3>Account security</h3>
+    <ul>
+      <li><code class="feature-badge feature-badge--verify">verify-email</code></li>
+      <li><code class="feature-badge feature-badge--change">change-password</code></li>
+      <li><code class="feature-badge feature-badge--reset">reset-password</code></li>
+    </ul>
+  </section>
+
+  <section class="auth-feature-group auth-feature-group--events">
+    <h3>Event handling</h3>
+    <ul>
+      <li><code class="feature-badge feature-badge--audit">audit</code></li>
+    </ul>
+  </section>
+</div>
+
+</ContainerSection>
+
+<ContainerSection>
+
+## Who is brkpt-auth for
+
+brkpt-auth is built for NestJS applications that need authentication code they can own, adapt, and grow over time.
+
+<CardGrid>
+  <Card title="MVP builders" icon="rocket">
+    Start with a working authentication foundation quickly, then add sessions, OAuth, OTP, audit, or other features as the product evolves.
+  </Card>
+
+  <Card title="Existing NestJS applications" icon="database">
+    Projects that already have their own user model, database, services, and infrastructure.
+  </Card>
+
+  <Card title="Long-term products" icon="code-branch">
+    Teams that want authentication code they can inspect, maintain, and adapt over time.
+  </Card>
+
+  <Card title="Composable auth systems" icon="puzzle">
+    Applications that need to start simple and add authentication capabilities gradually without rewriting existing features.
+  </Card>
+
+  <Card title="Multi-project builders" icon="random">
+    Developers who want to reuse authentication logic across NestJS projects while keeping each project free to use its own database, user model, and infrastructure.
+  </Card>
+
+  <Card title="Architecture-conscious teams" icon="setting">
+    Teams that want clear boundaries between authentication logic, application infrastructure, and project-specific implementation.
+  </Card>
+</CardGrid>
+
+</ContainerSection>
+
+</div>

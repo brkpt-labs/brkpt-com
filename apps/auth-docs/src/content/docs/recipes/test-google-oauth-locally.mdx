@@ -1,0 +1,79 @@
+---
+title: Test Google OAuth locally
+description: Get a Google id token and use it to test brkpt-auth OAuth sign-in without a frontend.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This recipe shows how to get a real Google `idToken` from Google OAuth 2.0 Playground and send it to the `oauth` endpoint from Add OAuth.
+
+Use this when you have finished [Add OAuth](../../guides/add-oauth/) but do not have a frontend sign-in page yet.
+
+<Aside type="caution">
+  OAuth tokens and authorization codes can be used to authenticate requests. Keep them private while testing.
+</Aside>
+
+## Prerequisites
+
+- A project completed from [Add OAuth](../../guides/add-oauth/)
+- Google OAuth client credentials configured in `.env`
+- An HTTP client for sending the test request
+
+## Get a Google id token
+
+Open [Google OAuth 2.0 Playground](https://developers.google.com/oauthplayground/).
+
+**Select scopes**
+
+In Step 1, expand **Google OAuth2 API v2** and select:
+
+- `https://www.googleapis.com/auth/userinfo.email`
+- `https://www.googleapis.com/auth/userinfo.profile`
+- `openid`
+
+These scopes let the returned ID token include the identity fields used by the example adapter.
+
+**Authorize the scopes**
+
+Click **Authorize APIs**, choose a Google account, and approve the request.
+
+After authorization, the Playground returns to Step 2 with an authorization code.
+
+**Exchange the authorization code**
+
+In Step 2, click **Exchange authorization code for tokens**.
+
+The response panel includes a JSON object with an `id_token` field. Copy the value of `id_token`.
+
+<Aside type="note">
+  Google returns the token field as `id_token`. The brkpt-auth Google driver expects the request body field to be named `idToken`, so paste that value into `idToken` in the next request.
+</Aside>
+
+## Call the brkpt-auth endpoint
+
+Send the copied token to your local NestJS server:
+
+```http
+POST /auth/oauth/google
+Content-Type: application/json
+
+{
+  "idToken": "<google-id-token>"
+}
+```
+
+If the token is valid, brkpt-auth signs in the matching user or creates a new user first. Both cases return the same token result as the other sign-in methods.
+
+## Troubleshooting
+
+**The payload does not include `email` or `name`.**
+
+Make sure you selected **Google OAuth2 API v2** scopes for `userinfo.email`, `userinfo.profile`, and `openid` before exchanging the authorization code.
+
+**The request is rejected as invalid or expired.**
+
+Get a fresh `id_token` from the Playground. ID tokens are short-lived.
+
+**The driver expects a different field name.**
+
+Check the `verify` method in your selected driver. The request body field must match what that method reads.

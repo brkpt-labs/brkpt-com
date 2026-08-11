@@ -1,0 +1,328 @@
+---
+title: Add OTP
+description: Add one-time password sign-in with email delivery.
+sidebar:
+  order: 6
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This guide continues from Add OAuth and adds the `otp` feature.
+
+The `otp` feature lets users sign in with a one-time code. In this guide, the code is sent by email, stored in Redis with a short TTL, and used with the same user model and JWT flow as the other sign-in methods.
+
+This guide uses `email` as the account identifier. If the email already exists, the user signs in. If it does not exist, a new user is created first.
+
+## Prerequisites
+
+- A project completed from [Add OAuth](../add-oauth/)
+- A running Redis instance
+- SMTP credentials for sending test emails
+
+## Add the OTP feature
+
+**Add the feature**
+
+Run the CLI command:
+
+```bash
+brkpt auth add otp --driver email
+```
+
+The CLI adds a new `features/otp/` folder with the selected driver files.
+
+<Aside type="tip">
+  You can also run `brkpt auth add otp` and select drivers interactively.
+</Aside>
+
+**Configure SMTP variables**
+
+The email driver sends OTP codes through SMTP. Add the SMTP variables to your existing `.env` file:
+
+```bash title=".env"
+SMTP_HOST="your-smtp-host"
+SMTP_PORT="587"
+SMTP_USER="your-smtp-user"
+SMTP_PASS="your-smtp-password"
+SMTP_FROM="no-reply@example.test"
+```
+
+For a local test inbox setup, see [Test email delivery locally](../../recipes/test-email-delivery-locally/).
+
+**Configure BrkptAuthModule**
+
+Add the `otp` options to `BrkptAuthModule.forRootAsync`:
+
+```diff lang="typescript" title="src/app.module.ts"
+ BrkptAuthModule.forRootAsync({
+   imports: [ConfigModule],
+   inject: [ConfigService],
+   useFactory: (config: ConfigService) => ({
+     jwt: {
+       // ...
+     },
+     oauth: {
+       // ...
+     },
++    otp: {
++      expiresIn: '5m',
++      codeLength: 6,
++      emailClient: {
++        host: config.getOrThrow('SMTP_HOST'),
++        port: Number(config.getOrThrow('SMTP_PORT')),
++        user: config.getOrThrow('SMTP_USER'),
++        pass: config.getOrThrow('SMTP_PASS'),
++        from: config.getOrThrow('SMTP_FROM'),
++      },
++    },
+   }),
+ }),
+```
+
+`expiresIn` controls how long an OTP code can be used. `codeLength` controls the generated code length. `emailClient` is used by the email driver to send the code.
+
+**Validate the DTOs**
+
+Most generated DTOs start empty, but the OTP feature already includes fixed fields because the OTP endpoints use a fixed request shape.
+
+This guide has already enabled `ValidationPipe`, so add validation decorators to the generated DTOs.
+
+Update `send.dto.ts`:
+
+```diff lang="typescript" title="src/brkpt-auth/features/otp/dto/send.dto.ts"
++import { IsString } from 'class-validator';
+
+ export class SendDto {
++  @IsString()
+   target!: string;
+ 
++  @IsString()
+   method!: string;
+ }
+```
+
+Update `authenticate.dto.ts`:
+
+```diff lang="typescript" title="src/brkpt-auth/features/otp/dto/authenticate.dto.ts"
++import { IsString } from 'class-validator';
+
+ export class AuthenticateDto {
++  @IsString()
+   target!: string;
+ 
++  @IsString()
+   code!: string;
+ }
+```
+
+This guide uses `method: "email"`, so `target` is an email address. The DTO keeps `target` as a string because the meaning of `target` depends on the selected method.
+
+**Implement `OtpAdapter`**
+
+The OTP adapter stores codes in Redis, maps the submitted target to `UserProfile`, and finds or creates a user.
+
+Create `otp.adapter.ts` and implement the Redis-backed, Prisma-backed OTP adapter:
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - otp.adapter.ts
+</FileTree>
+
+```typescript title="src/brkpt-auth/adapters/otp.adapter.ts"
+import { Inject, Injectable } from '@nestjs/common';
+import { type RedisClientType } from 'redis';
+
+import { User } from '../../../generated/prisma/client';
+import { PrismaService } from '../../prisma/prisma.service';
+import { OtpCodeData } from '../common/interfaces';
+import { OtpPort } from '../features/otp/otp.port';
+import { UserProfile } from './types';
+
+@Injectable()
+export class OtpAdapter implements OtpPort<User, UserProfile> {
+  constructor(
+    @Inject('REDIS_CLIENT') private readonly redis: RedisClientType,
+    private readonly prisma: PrismaService,
+  ) {}
+
+  private key(target: string) {
+    return `otp:${target}`;
+  }
+
+  async saveCode(
+    target: string,
+    data: OtpCodeData,
+    ttlMs: number,
+  ): Promise<void> {
+    await this.redis.set(this.key(target), JSON.stringify(data), {
+      expiration: { type: 'PX', value: ttlMs },
+    });
+  }
+
+  async getCodeData(target: string): Promise<OtpCodeData | null> {
+    const data = await this.redis.get(this.key(target));
+    return data ? (JSON.parse(data) as OtpCodeData) : null;
+  }
+
+  async deleteCode(target: string): Promise<void> {
+    await this.redis.del(this.key(target));
+  }
+
+  mapTargetToProfile(method: string, target: string): UserProfile | undefined {
+    switch (method) {
+      case 'email':
+        return { name: '', email: target };
+    }
+  }
+
+  async findOrCreateUserByProfile(
+    profile: UserProfile,
+  ): Promise<{ user: User; created: boolean }> {
+    const existing = await this.prisma.user.findUnique({
+      where: { email: profile.email },
+    });
+    if (existing) {
+      return { user: existing, created: false };
+    }
+
+    const user = await this.prisma.user.create({
+      data: {
+        name: profile.name,
+        email: profile.email,
+        password: '',
+      },
+    });
+
+    return { user, created: true };
+  }
+
+  extractUserIdFromUser(user: User): number {
+    return user.id;
+  }
+}
+```
+
+For `method: "email"`, this guide maps the submitted email address to `UserProfile`. If a user with that email already exists, the stored user data is used. If no user exists, a new user is created with an empty `name` because the OTP request only provides an email address. You can change this mapping logic for your own application.
+
+<Aside type="note">
+  OTP-created users store an empty password in this guide. This does not make empty-password sign-in possible: credentials sign-in still verifies the submitted password with `bcrypt.compare`, and an empty stored value is not the bcrypt hash of an empty password. Later features can let these users set or reset a password, so they can also sign in with email and password.
+</Aside>
+
+**Register the feature**
+
+Update `features.ts` and pass `OtpAdapter` and `EmailOtpDriver` to `otpFeature`:
+
+```typescript title="src/brkpt-auth/features.ts" ins="OtpAdapter" ins="EmailOtpDriver"
+import { BlacklistAdapter } from './adapters/blacklist.adapter';
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { OAuthAdapter } from './adapters/oauth.adapter';
+import { OtpAdapter } from './adapters/otp.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { blacklistFeature } from './features/blacklist/blacklist.feature';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { GithubOAuthDriver } from './features/oauth/drivers/github.driver';
+import { GoogleOAuthDriver } from './features/oauth/drivers/google.driver';
+import { oauthFeature } from './features/oauth/oauth.feature';
+import { EmailOtpDriver } from './features/otp/drivers/email.driver';
+import { otpFeature } from './features/otp/otp.feature';
+import { sessionFeature } from './features/session/session.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  blacklistFeature(BlacklistAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+  oauthFeature(OAuthAdapter, GoogleOAuthDriver, GithubOAuthDriver),
+  otpFeature(OtpAdapter, EmailOtpDriver),
+];
+```
+
+Only drivers passed to `otpFeature` are enabled. You can keep a driver file in the project without enabling it here.
+
+## Run and verify
+
+Start the application:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+The `otp` feature adds two endpoints:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/auth/otp/send` | Send an OTP code |
+| `POST` | `/auth/otp/authenticate` | Sign in with an OTP code |
+
+The send endpoint receives a `method` field. The value must match an enabled OTP driver. In this guide, `EmailOtpDriver` uses `method = 'email'`, so the send request body uses `"method": "email"`.
+
+**Send an OTP code**
+
+Send a code to an email address:
+
+```http
+POST /auth/otp/send
+Content-Type: application/json
+
+{
+  "target": "kevin@example.com",
+  "method": "email"
+}
+```
+
+Open the inbox for the SMTP account or test inbox you configured, then copy the OTP code from the email.
+
+The email body should look similar to this:
+
+```text
+Your OTP code is: 127419
+```
+
+<Aside type="tip">
+  The email driver is source code in your project. To customize the email subject or body, edit the `send` method in `features/otp/drivers/email.driver.ts`.
+</Aside>
+
+**Authenticate with the OTP code**
+
+Send the copied code to the authentication endpoint:
+
+```http
+POST /auth/otp/authenticate
+Content-Type: application/json
+
+{
+  "target": "kevin@example.com",
+  "code": "127419"
+}
+```
+
+If the email already exists, the request signs in that user. If it does not exist, a new user is created first. Both cases return the same token result as the other sign-in methods.
+
+<Aside type="note">
+  OTP codes expire according to the `otp.expiresIn` option. Sending a new code to the same target invalidates the previous code, so only the latest code can be used for authentication.
+</Aside>

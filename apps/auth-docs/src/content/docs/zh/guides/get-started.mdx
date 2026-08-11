@@ -1,0 +1,790 @@
+---
+title: 开始使用
+description: 构建一个具备注册、登录、登出、刷新令牌和无状态 JWT 身份验证的 NestJS 项目。
+sidebar:
+  order: 1
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+本指南会带你搭建一个使用 brkpt-auth 的最小化 NestJS 应用。
+
+你将从一个新的 NestJS 项目开始，初始化 brkpt-auth，配置 JWT 身份验证，实现所需的适配器，并通过 `credentials` 功能启用账号密码登录。
+
+完成本指南后，你的应用将支持：
+
+- `POST /auth/sign-up`
+- `POST /auth/sign-in`
+- `POST /auth/sign-out`
+- `POST /auth/refresh`
+- `GET /auth/me`
+
+## 前置条件
+
+- Node.js 20+
+
+## 创建 NestJS 项目
+
+安装 NestJS CLI 并创建新项目：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add -g @nestjs/cli
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install -g @nestjs/cli
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn global add @nestjs/cli
+```
+
+  </TabItem>
+</Tabs>
+
+创建一个新的 NestJS 项目：
+
+```bash
+nest new brkpt-auth-get-started --strict
+```
+
+然后进入项目目录：
+
+```bash
+cd brkpt-auth-get-started
+```
+
+你可以删除默认的 `app.controller.ts`、`app.controller.spec.ts` 和 `app.service.ts` 文件，本指南不会用到它们。
+
+## 初始化 brkpt-auth
+
+全局安装 brkpt CLI：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add -g @brkpt/cli
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install -g @brkpt/cli
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn global add @brkpt/cli
+```
+
+  </TabItem>
+</Tabs>
+
+在项目根目录运行初始化命令：
+
+```bash
+brkpt auth init
+```
+
+<Aside type="tip">
+  如果不想全局安装 CLI，可以改用 `npx @brkpt/cli auth init`。
+</Aside>
+
+CLI 会检测你的项目结构，安装 brkpt-auth 源文件，并列出你需要补充安装的缺失依赖。
+
+`core` 功能默认会被添加，它提供基础的 JWT 流程，以及 `/auth/me`、`/auth/refresh`、`/auth/sign-out` 等共享端点。
+
+## 配置 BrkptAuthModule
+
+`core` 功能需要为 access token 和 refresh token 分别配置。
+
+**安装依赖**
+
+安装本指南用到的依赖：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add @nestjs/config @nestjs/event-emitter cookie-parser
+pnpm add -D @types/cookie-parser
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install @nestjs/config @nestjs/event-emitter cookie-parser
+npm install -D @types/cookie-parser
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn add @nestjs/config @nestjs/event-emitter cookie-parser
+yarn add -D @types/cookie-parser
+```
+
+  </TabItem>
+</Tabs>
+
+**创建环境变量**
+
+在项目根目录创建 `.env` 文件：
+
+```bash title=".env"
+JWT_ACCESS_SECRET="your-access-secret"
+JWT_REFRESH_SECRET="your-refresh-secret"
+```
+**注册 `BrkptAuthModule`**
+
+在 `app.module.ts` 中注册 `ConfigModule`、`EventEmitterModule` 和 `BrkptAuthModule`：
+
+```typescript title="src/app.module.ts"
+import { Module } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { EventEmitterModule } from '@nestjs/event-emitter';
+
+import { BrkptAuthModule } from './brkpt-auth/brkpt-auth.module';
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
+    EventEmitterModule.forRoot({
+      global: true,
+      wildcard: true,
+    }),
+    BrkptAuthModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        jwt: {
+          access: {
+            secret: config.getOrThrow('JWT_ACCESS_SECRET'),
+            expiresIn: '5m',
+          },
+          refresh: {
+            secret: config.getOrThrow('JWT_REFRESH_SECRET'),
+            expiresIn: '1h',
+            transport: 'cookie',
+          },
+        },
+      }),
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+本指南使用 `cookie` 方式传输 refresh token。这种模式下，brkpt-auth 会把 refresh token 写入 HttpOnly cookie，客户端不需要手动处理它。
+
+<Aside type="note">
+  你也可以使用 `body` 方式传输。这种模式下，refresh token 会包含在响应体中返回，调用 refresh 端点时需要手动传递。
+</Aside>
+
+**启用 `cookie-parser`**
+
+在 `main.ts` 中启用 `cookie-parser`：
+
+```diff lang="typescript" title="src/main.ts"
+import { NestFactory } from '@nestjs/core';
++import cookieParser from 'cookie-parser';
+
+import { AppModule } from './app.module';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
++  app.use(cookieParser());
+  await app.listen(process.env.PORT ?? 3000);
+}
+void bootstrap();
+```
+
+## 准备用户模块
+
+brkpt-auth 不要求特定的数据库 schema、用户模型、ORM 或 repository 结构。
+
+本指南在 `UserModule` 里用一个小型内存 repository，这样你无需搭建数据库就能跑通身份验证流程。
+
+在实际应用中，你的 `UserModule` 通常会提供基于 ORM 的服务或 repository，比如 Prisma service、TypeORM repository，或者你自己的用户数据访问 provider。
+
+创建以下文件：
+
+<FileTree>
+- src/
+  - user/
+    - repositories/
+      - memory-user.repository.ts
+    - user.entity.ts
+    - user.module.ts
+</FileTree>
+
+**定义用户类型**
+
+创建 `user.entity.ts`，定义本指南使用的用户结构：
+
+```typescript title="src/user/user.entity.ts"
+export interface User {
+  id: number;
+  name: string;
+  email: string;
+  password: string;
+}
+```
+
+brkpt-auth 不要求固定的用户结构。本指南的示例应用使用 `id`、`name`、`email` 和 `password`。你后面编写的适配器会决定哪些字段用于 JWT 载荷、密码校验和安全的用户响应。
+
+**创建 `MemoryUserRepository`**
+
+把 `memory-user.repository.ts` 创建为一个小型内存 repository：
+
+```typescript title="src/user/repositories/memory-user.repository.ts"
+import { Injectable } from '@nestjs/common';
+
+import { User } from '../user.entity';
+
+@Injectable()
+export class MemoryUserRepository {
+  private users: User[] = [];
+  private currentId = 1;
+
+  findOne(predicate: (u: User) => boolean): Promise<User | null> {
+    return Promise.resolve(this.users.find(predicate) || null);
+  }
+
+  findAll(): Promise<User[]> {
+    return Promise.resolve([...this.users]);
+  }
+
+  create(data: Omit<User, 'id'>): Promise<User> {
+    const newUser: User = {
+      id: this.currentId++,
+      ...data,
+    };
+    this.users.push(newUser);
+    return Promise.resolve(newUser);
+  }
+
+  update(id: number, data: Partial<Omit<User, 'id'>>): Promise<User> {
+    const userIndex = this.users.findIndex((u) => u.id === id);
+    if (userIndex === -1) {
+      throw new Error(`User with id ${id} not found`);
+    }
+    const updated = { ...this.users[userIndex], ...data };
+    this.users[userIndex] = updated;
+    return Promise.resolve(updated);
+  }
+
+  delete(id: number): Promise<User> {
+    const userIndex = this.users.findIndex((u) => u.id === id);
+    if (userIndex === -1) {
+      throw new Error(`User with id ${id} not found`);
+    }
+    const [deleted] = this.users.splice(userIndex, 1);
+    return Promise.resolve(deleted);
+  }
+}
+```
+
+<Aside type="note">
+  这个 repository 只是为了让指南保持简洁。应用重启后数据会丢失。
+</Aside>
+
+**创建 `UserModule`**
+
+创建 `user.module.ts`，导出 `MemoryUserRepository` 以便适配器可以注入它：
+
+```typescript title="src/user/user.module.ts"
+import { Module } from '@nestjs/common';
+
+import { MemoryUserRepository } from './repositories/memory-user.repository';
+
+@Module({
+  providers: [MemoryUserRepository],
+  exports: [MemoryUserRepository],
+})
+export class UserModule {}
+```
+
+## 接入 core 功能
+
+`core` 功能负责基础的 JWT 流程，但它并不知道你的用户模型长什么样。core 适配器告诉 brkpt-auth 如何把用户映射为 JWT 载荷、如何从 JWT 载荷查找用户，以及如何返回安全的用户数据。
+
+<Aside type="note">
+  本指南把适配器放在 `src/brkpt-auth/adapters/` 下，方便与 brkpt-auth 添加的源文件区分开。你可以把适配器放在任何位置，只要导入和 provider 配置正确即可。
+</Aside>
+
+创建以下文件：
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - core.adapter.ts
+      - types.ts
+</FileTree>
+
+**定义 JWT 载荷**
+
+创建 `types.ts`：
+
+```typescript title="src/brkpt-auth/adapters/types.ts"
+export type AuthJwtPayload = {
+  sub: number;
+  email: string;
+};
+```
+
+**实现 `CoreAdapter`**
+
+创建 `core.adapter.ts`：
+
+```typescript title="src/brkpt-auth/adapters/core.adapter.ts"
+import { Injectable } from '@nestjs/common';
+
+import { MemoryUserRepository } from '../../user/repositories/memory-user.repository';
+import { User } from '../../user/user.entity';
+import { CorePort } from '../features/core/core.port';
+import { AuthJwtPayload } from './types';
+
+@Injectable()
+export class CoreAdapter implements CorePort<User> {
+  constructor(private readonly userRepo: MemoryUserRepository) {}
+
+  mapUserToJwtPayload(user: User): AuthJwtPayload {
+    return {
+      sub: user.id,
+      email: user.email,
+    };
+  }
+
+  shrinkJwtPayload(payload: AuthJwtPayload): Record<string, unknown> {
+    return {
+      sub: payload.sub,
+    };
+  }
+
+  findUserByJwtPayload(payload: AuthJwtPayload): Promise<User | null> {
+    return this.userRepo.findOne((u) => u.id === payload.sub);
+  }
+
+  toSafeUser(user: User): Record<string, unknown> {
+    const { password: _password, ...safe } = user;
+    return safe;
+  }
+
+  extractUserIdFromJwtPayload(payload: AuthJwtPayload): number {
+    return payload.sub;
+  }
+}
+```
+
+每个方法要么是简单的映射，要么是对用户 repository 的直接调用。
+
+<Aside type="tip">
+  `_password` 这个变量名表示该字段是有意不使用的。如果你的 ESLint 配置对它报错，请为以 `_` 开头的变量添加忽略规则。
+</Aside>
+
+**注册功能**
+
+更新 `features.ts`，把 `CoreAdapter` 传给 `coreFeature`：
+
+```typescript title="src/brkpt-auth/features.ts" ins="CoreAdapter"
+import { CoreAdapter } from './adapters/core.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { coreFeature } from './features/core/core.feature';
+
+export const features: FeatureConfig[] = [coreFeature(CoreAdapter)];
+```
+
+**导入 `UserModule`**
+
+`CoreAdapter` 依赖 `MemoryUserRepository`，而它是由 `UserModule` 导出的。
+
+把 `UserModule` 添加到 `brkpt-auth.module.ts`：
+
+```diff lang="typescript" title="src/brkpt-auth/brkpt-auth.module.ts"
++import { UserModule } from '../user/user.module';
+
+@Module({
+-  imports: [],
++  imports: [UserModule],
+  controllers: [...features.flatMap((f) => f.controllers)],
+  providers: [...features.flatMap((f) => f.providers)],
+})
+export class BrkptAuthModule {
+  // ...
+}
+```
+
+到这一步，`core` 功能已经能从 JWT 载荷解析用户并返回安全的用户数据。
+
+如果此时启动应用并调用 `GET /auth/me`，会返回 `401 Unauthorized`。这是预期行为，因为应用还没有注册或登录端点。
+
+## 添加 credentials 功能
+
+`core` 功能不包含账号注册或登录，这是有意为之：你可以自行选择应用需要的登录方式。
+
+本指南使用 `credentials` 功能实现账号密码登录。
+
+**添加功能**
+
+运行 CLI 命令：
+
+```bash
+brkpt auth add credentials
+```
+
+<Aside type="tip">
+  你也可以直接运行 `brkpt auth add`，不指定功能名称，然后在交互式界面中选择功能。
+</Aside>
+
+CLI 会添加一个新的 `features/credentials/` 文件夹。
+
+**定义 DTO**
+
+`credentials` 功能默认生成空的 DTO 类。brkpt-auth 不会假设你的注册和登录请求使用哪些字段。
+
+更新 `sign-up.dto.ts`：
+
+```diff lang="typescript" title="src/brkpt-auth/features/credentials/dto/sign-up.dto.ts"
+export class SignUpDto {
++  name!: string;
++  email!: string;
++  password!: string;
+}
+```
+
+更新 `sign-in.dto.ts`：
+
+```diff lang="typescript" title="src/brkpt-auth/features/credentials/dto/sign-in.dto.ts"
+export class SignInDto {
++  email!: string;
++  password!: string;
+}
+```
+
+<Aside type="note">
+  本指南用 `email` 作为唯一的账号标识符。你自己的 credentials 流程可以使用用户名、手机号或任何其他标识符。
+</Aside>
+
+**安装 bcrypt**
+
+本指南用 `bcrypt` 来哈希和校验密码：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add bcrypt
+pnpm add -D @types/bcrypt
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install bcrypt
+npm install -D @types/bcrypt
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn add bcrypt
+yarn add -D @types/bcrypt
+```
+
+  </TabItem>
+</Tabs>
+
+**实现 `CredentialsAdapter`**
+
+创建 `credentials.adapter.ts`：
+
+```typescript title="src/brkpt-auth/adapters/credentials.adapter.ts"
+import { Injectable } from '@nestjs/common';
+import * as bcrypt from 'bcrypt';
+
+import { MemoryUserRepository } from '../../user/repositories/memory-user.repository';
+import { User } from '../../user/user.entity';
+import { CredentialsPort } from '../features/credentials/credentials.port';
+import { SignInDto } from '../features/credentials/dto/sign-in.dto';
+import { SignUpDto } from '../features/credentials/dto/sign-up.dto';
+
+@Injectable()
+export class CredentialsAdapter implements CredentialsPort<User> {
+  constructor(private readonly userRepo: MemoryUserRepository) {}
+
+  findUserByDto(dto: SignInDto | SignUpDto): Promise<User | null> {
+    return this.userRepo.findOne((u) => u.email === dto.email);
+  }
+
+  validatePassword(user: User, dto: SignInDto): Promise<boolean> {
+    return bcrypt.compare(dto.password, user.password);
+  }
+
+  async createUser(dto: SignUpDto): Promise<User> {
+    const password = await bcrypt.hash(dto.password, 10);
+    return this.userRepo.create({
+      name: dto.name,
+      email: dto.email,
+      password: password,
+    });
+  }
+
+  extractUserIdFromUser(user: User): number {
+    return user.id;
+  }
+}
+```
+
+密码策略完全由适配器控制。只需修改 `validatePassword` 和 `createUser`，就能把 `bcrypt` 换成 `argon2` 或其他任意哈希库。
+
+**注册功能**
+
+更新 `features.ts`，把 `CredentialsAdapter` 传给 `credentialsFeature`：
+
+```typescript title="src/brkpt-auth/features.ts" ins="CredentialsAdapter"
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  credentialsFeature(CredentialsAdapter),
+];
+```
+
+`CredentialsAdapter` 用的是同一个 `MemoryUserRepository`，不需要额外导入其他模块。
+
+## 校验请求数据
+
+brkpt-auth 不强制要求使用某个校验库。本指南使用标准的 NestJS `ValidationPipe` 配合 `class-validator`。
+
+**安装校验依赖**
+
+安装依赖：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add class-validator class-transformer
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install class-validator class-transformer
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn add class-validator class-transformer
+```
+
+  </TabItem>
+</Tabs>
+
+**启用 `ValidationPipe`**
+
+在 `main.ts` 中启用全局校验管道：
+
+```diff lang="typescript" title="src/main.ts"
++import { ValidationPipe } from '@nestjs/common';
+import { NestFactory } from '@nestjs/core';
+import cookieParser from 'cookie-parser';
+
+import { AppModule } from './app.module';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  app.use(cookieParser());
++  app.useGlobalPipes(
++    new ValidationPipe({
++      whitelist: true,
++      forbidNonWhitelisted: true,
++      transform: true,
++    }),
++  );
+  await app.listen(process.env.PORT ?? 3000);
+}
+void bootstrap();
+```
+
+**为 DTO 添加校验**
+
+为 `sign-up.dto.ts` 添加校验装饰器：
+
+```diff lang="typescript" title="src/brkpt-auth/features/credentials/dto/sign-up.dto.ts"
++import { IsEmail, IsString, MinLength } from 'class-validator';
+
+export class SignUpDto {
++  @IsString()
+  name!: string;
+
++  @IsEmail()
+  email!: string;
+
++  @IsString()
++  @MinLength(6)
+  password!: string;
+}
+```
+
+为 `sign-in.dto.ts` 添加校验装饰器：
+
+```diff lang="typescript" title="src/brkpt-auth/features/credentials/dto/sign-in.dto.ts"
++import { IsEmail, IsString } from 'class-validator';
+
+export class SignInDto {
++  @IsEmail()
+  email!: string;
+
++  @IsString()
+  password!: string;
+}
+```
+
+## 运行并验证
+
+启动应用：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+现在可以使用以下端点：
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/auth/sign-up` | 创建用户 |
+| `POST` | `/auth/sign-in` | 登录 |
+| `POST` | `/auth/sign-out` | 登出 |
+| `POST` | `/auth/refresh` | 签发新的 access token |
+| `GET` | `/auth/me` | 返回当前用户 |
+
+用任意 HTTP 客户端测试这些端点，比如 Postman、Bruno 或 Insomnia。
+
+**注册**
+
+发送注册请求：
+
+```http
+POST /auth/sign-up
+Content-Type: application/json
+
+{
+  "name": "Kevin",
+  "email": "kevin@example.com",
+  "password": "password123"
+}
+```
+
+响应中包含 `accessToken`，并把 refresh token 设置为 HttpOnly cookie。
+
+**登录**
+
+用同一个账号发送登录请求：
+
+```http
+POST /auth/sign-in
+Content-Type: application/json
+
+{
+  "email": "kevin@example.com",
+  "password": "password123"
+}
+```
+
+和注册一样，响应中包含 `accessToken`，并设置 refresh token cookie。
+
+**获取当前用户**
+
+带上 access token 调用 `/auth/me`：
+
+```http
+GET /auth/me
+Authorization: Bearer <access-token>
+```
+
+响应返回当前用户，不含密码字段。
+
+**刷新 access token**
+
+带上注册或登录时设置的 refresh token cookie，调用 `/auth/refresh`：
+
+```http
+POST /auth/refresh
+Cookie: refreshToken=<refresh-token>
+```
+
+响应中包含新的 `accessToken`。
+
+**登出**
+
+带上 access token 调用 `/auth/sign-out`：
+
+```http
+POST /auth/sign-out
+Authorization: Bearer <access-token>
+```
+
+在 `cookie` 传输模式下，登出会清除 refresh token cookie（如果存在的话）。
+
+<Aside type="note">
+  确保你的 HTTP 客户端保留了注册或登录返回的 cookie。在 Bruno、Postman 或 Insomnia 中，这通常由客户端的 cookie 存储自动处理。
+</Aside>
+
+<Aside type="note">
+  access token 在过期之前始终有效，这是无状态 JWT 身份验证的正常行为。如果需要立即撤销 access token，可以继续阅读[添加 blacklist](../add-blacklist/)。
+</Aside>
+
+<Aside type="note">
+  本指南使用内存存储，重启应用会清空所有用户。继续阅读[使用 Prisma](../use-prisma/) 来接入持久化数据库。
+</Aside>
+
+## 下一步
+
+按顺序继续阅读后续指南，替换内存 repository、添加会话管理，并逐个功能地扩展你的身份验证流程。

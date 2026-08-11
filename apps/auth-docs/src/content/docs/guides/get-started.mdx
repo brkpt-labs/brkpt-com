@@ -1,0 +1,792 @@
+---
+title: Get started
+description: Build a NestJS project with sign-up, sign-in, sign-out, refresh, and stateless JWT authentication.
+sidebar:
+  order: 1
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This guide walks you through a minimal NestJS application using brkpt-auth.
+
+You will start from a new NestJS project, initialize brkpt-auth, configure JWT authentication, implement the required adapters, and enable account-password authentication with the `credentials` feature.
+
+By the end of this guide, your application will support:
+
+- `POST /auth/sign-up`
+- `POST /auth/sign-in`
+- `POST /auth/sign-out`
+- `POST /auth/refresh`
+- `GET /auth/me`
+
+## Prerequisites
+
+- Node.js 20+
+
+## Create a NestJS project
+
+Install the NestJS CLI and create a new project:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add -g @nestjs/cli
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install -g @nestjs/cli
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn global add @nestjs/cli
+```
+
+  </TabItem>
+</Tabs>
+
+Create a new NestJS project:
+
+```bash
+nest new brkpt-auth-get-started --strict
+```
+
+Then enter the project directory:
+
+```bash
+cd brkpt-auth-get-started
+```
+
+You can remove the default `app.controller.ts`, `app.controller.spec.ts`, and `app.service.ts` files. This guide does not use them.
+
+## Initialize brkpt-auth
+
+Install the brkpt CLI globally:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add -g @brkpt/cli
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install -g @brkpt/cli
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn global add @brkpt/cli
+```
+
+  </TabItem>
+</Tabs>
+
+Run the initialization command from the project root:
+
+```bash
+brkpt auth init
+```
+
+<Aside type="tip">
+  If you do not want to install the CLI globally, you can use `npx @brkpt/cli auth init` instead.
+</Aside>
+
+The CLI detects your project structure, installs the brkpt-auth source files, and shows any missing dependencies you need to add.
+
+The `core` feature is added by default. It provides the base JWT flow and shared endpoints such as `/auth/me`, `/auth/refresh`, and `/auth/sign-out`.
+
+## Configure BrkptAuthModule
+
+The `core` feature needs separate configuration for access tokens and refresh tokens.
+
+**Install dependencies**
+
+Install the dependencies used in this guide:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add @nestjs/config @nestjs/event-emitter cookie-parser
+pnpm add -D @types/cookie-parser
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install @nestjs/config @nestjs/event-emitter cookie-parser
+npm install -D @types/cookie-parser
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn add @nestjs/config @nestjs/event-emitter cookie-parser
+yarn add -D @types/cookie-parser
+```
+
+  </TabItem>
+</Tabs>
+
+**Create environment variables**
+
+Create a `.env` file in the project root:
+
+```bash title=".env"
+JWT_ACCESS_SECRET="your-access-secret"
+JWT_REFRESH_SECRET="your-refresh-secret"
+```
+**Register `BrkptAuthModule`**
+
+Register `ConfigModule`, `EventEmitterModule`, and `BrkptAuthModule` in `app.module.ts`:
+
+```typescript title="src/app.module.ts"
+import { Module } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { EventEmitterModule } from '@nestjs/event-emitter';
+
+import { BrkptAuthModule } from './brkpt-auth/brkpt-auth.module';
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
+    EventEmitterModule.forRoot({
+      global: true,
+      wildcard: true,
+    }),
+    BrkptAuthModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        jwt: {
+          access: {
+            secret: config.getOrThrow('JWT_ACCESS_SECRET'),
+            expiresIn: '5m',
+          },
+          refresh: {
+            secret: config.getOrThrow('JWT_REFRESH_SECRET'),
+            expiresIn: '1h',
+            transport: 'cookie',
+          },
+        },
+      }),
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+This guide uses `cookie` transport for refresh tokens. In this mode, brkpt-auth writes the refresh token to an HttpOnly cookie, so the client does not need to handle it manually.
+
+<Aside type="note">
+  You can also use `body` transport. In that mode, refresh tokens are returned in the response body and must be sent manually when calling the refresh endpoint.
+</Aside>
+
+**Enable `cookie-parser`**
+
+Enable `cookie-parser` in `main.ts`:
+
+```diff lang="typescript" title="src/main.ts"
+import { NestFactory } from '@nestjs/core';
++import cookieParser from 'cookie-parser';
+
+import { AppModule } from './app.module';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
++  app.use(cookieParser());
+  await app.listen(process.env.PORT ?? 3000);
+}
+void bootstrap();
+```
+
+## Prepare a user module
+
+brkpt-auth does not require a specific database schema, user model, ORM, or repository structure.
+
+This guide uses a small in-memory repository inside a `UserModule` so you can complete the authentication flow without setting up a database.
+
+In a real application, your `UserModule` would usually provide an ORM-backed service or repository, such as a Prisma service, a TypeORM repository, or your own user data access provider.
+
+Create the following files:
+
+<FileTree>
+- src/
+  - user/
+    - repositories/
+      - memory-user.repository.ts
+    - user.entity.ts
+    - user.module.ts
+</FileTree>
+
+**Define the user type**
+
+Create `user.entity.ts` and define the user shape used in this guide:
+
+```typescript title="src/user/user.entity.ts"
+export interface User {
+  id: number;
+  name: string;
+  email: string;
+  password: string;
+}
+```
+
+brkpt-auth does not require a fixed user shape. This guide uses `id`, `name`, `email`, and `password` for the example application. The adapters you write later will decide which fields are used in JWT payloads, password validation, and safe user responses.
+
+**Create `MemoryUserRepository`**
+
+Create `memory-user.repository.ts` as a small in-memory repository:
+
+Create a small in-memory repository:
+
+```typescript title="src/user/repositories/memory-user.repository.ts"
+import { Injectable } from '@nestjs/common';
+
+import { User } from '../user.entity';
+
+@Injectable()
+export class MemoryUserRepository {
+  private users: User[] = [];
+  private currentId = 1;
+
+  findOne(predicate: (u: User) => boolean): Promise<User | null> {
+    return Promise.resolve(this.users.find(predicate) || null);
+  }
+
+  findAll(): Promise<User[]> {
+    return Promise.resolve([...this.users]);
+  }
+
+  create(data: Omit<User, 'id'>): Promise<User> {
+    const newUser: User = {
+      id: this.currentId++,
+      ...data,
+    };
+    this.users.push(newUser);
+    return Promise.resolve(newUser);
+  }
+
+  update(id: number, data: Partial<Omit<User, 'id'>>): Promise<User> {
+    const userIndex = this.users.findIndex((u) => u.id === id);
+    if (userIndex === -1) {
+      throw new Error(`User with id ${id} not found`);
+    }
+    const updated = { ...this.users[userIndex], ...data };
+    this.users[userIndex] = updated;
+    return Promise.resolve(updated);
+  }
+
+  delete(id: number): Promise<User> {
+    const userIndex = this.users.findIndex((u) => u.id === id);
+    if (userIndex === -1) {
+      throw new Error(`User with id ${id} not found`);
+    }
+    const [deleted] = this.users.splice(userIndex, 1);
+    return Promise.resolve(deleted);
+  }
+}
+```
+
+<Aside type="note">
+  This repository is only used to keep the guide small. Data is lost when the application restarts.
+</Aside>
+
+**Create `UserModule`**
+
+Create `user.module.ts` and export `MemoryUserRepository` so adapters can inject it:
+
+```typescript title="src/user/user.module.ts"
+import { Module } from '@nestjs/common';
+
+import { MemoryUserRepository } from './repositories/memory-user.repository';
+
+@Module({
+  providers: [MemoryUserRepository],
+  exports: [MemoryUserRepository],
+})
+export class UserModule {}
+```
+
+## Connect the core feature
+
+The `core` feature handles the base JWT flow, but it does not know what your user model looks like. The core adapter tells brkpt-auth how to map users to JWT payloads, find users from JWT payloads, and return safe user data.
+
+<Aside type="note">
+  This guide keeps adapters in `src/brkpt-auth/adapters/` so they are easy to distinguish from the source files added by brkpt-auth. You can place adapters anywhere as long as the imports and providers are configured correctly.
+</Aside>
+
+Create the following files:
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - core.adapter.ts
+      - types.ts
+</FileTree>
+
+**Define the JWT payload**
+
+Create `types.ts`:
+
+```typescript title="src/brkpt-auth/adapters/types.ts"
+export type AuthJwtPayload = {
+  sub: number;
+  email: string;
+};
+```
+
+**Implement `CoreAdapter`**
+
+Create `core.adapter.ts`:
+
+```typescript title="src/brkpt-auth/adapters/core.adapter.ts"
+import { Injectable } from '@nestjs/common';
+
+import { MemoryUserRepository } from '../../user/repositories/memory-user.repository';
+import { User } from '../../user/user.entity';
+import { CorePort } from '../features/core/core.port';
+import { AuthJwtPayload } from './types';
+
+@Injectable()
+export class CoreAdapter implements CorePort<User> {
+  constructor(private readonly userRepo: MemoryUserRepository) {}
+
+  mapUserToJwtPayload(user: User): AuthJwtPayload {
+    return {
+      sub: user.id,
+      email: user.email,
+    };
+  }
+
+  shrinkJwtPayload(payload: AuthJwtPayload): Record<string, unknown> {
+    return {
+      sub: payload.sub,
+    };
+  }
+
+  findUserByJwtPayload(payload: AuthJwtPayload): Promise<User | null> {
+    return this.userRepo.findOne((u) => u.id === payload.sub);
+  }
+
+  toSafeUser(user: User): Record<string, unknown> {
+    const { password: _password, ...safe } = user;
+    return safe;
+  }
+
+  extractUserIdFromJwtPayload(payload: AuthJwtPayload): number {
+    return payload.sub;
+  }
+}
+```
+
+Each method is a small mapping or a direct call to your user repository.
+
+<Aside type="tip">
+  The `_password` variable name marks the field as intentionally unused. If your ESLint configuration reports it, add an ignore pattern for variables starting with `_`.
+</Aside>
+
+**Register the feature**
+
+Update `features.ts` and pass `CoreAdapter` to `coreFeature`:
+
+```typescript title="src/brkpt-auth/features.ts" ins="CoreAdapter"
+import { CoreAdapter } from './adapters/core.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { coreFeature } from './features/core/core.feature';
+
+export const features: FeatureConfig[] = [coreFeature(CoreAdapter)];
+```
+
+**Import `UserModule`**
+
+`CoreAdapter` depends on `MemoryUserRepository`, which is exported by `UserModule`.
+
+Add `UserModule` to `brkpt-auth.module.ts`:
+
+```diff lang="typescript" title="src/brkpt-auth/brkpt-auth.module.ts"
++import { UserModule } from '../user/user.module';
+
+@Module({
+-  imports: [],
++  imports: [UserModule],
+  controllers: [...features.flatMap((f) => f.controllers)],
+  providers: [...features.flatMap((f) => f.providers)],
+})
+export class BrkptAuthModule {
+  // ...
+}
+```
+
+At this point, the `core` feature can resolve users from JWT payloads and return safe user data.
+
+If you start the application now and call `GET /auth/me`, it should return `401 Unauthorized`. This is expected because the application does not have sign-up or sign-in endpoints yet.
+
+## Add the credentials feature
+
+The `core` feature does not include account registration or sign-in. This is intentional: you can choose the sign-in methods your application needs.
+
+This guide uses the `credentials` feature for account-password authentication.
+
+**Add the feature**
+
+Run the CLI command:
+
+```bash
+brkpt auth add credentials
+```
+
+<Aside type="tip">
+  You can also run `brkpt auth add` without a feature name and select the feature interactively.
+</Aside>
+
+The CLI adds a new `features/credentials/` folder.
+
+**Define the DTOs**
+
+The `credentials` feature generates empty DTO classes by default. brkpt-auth does not assume which fields your sign-up and sign-in requests use.
+
+Update `sign-up.dto.ts`:
+
+```diff lang="typescript" title="src/brkpt-auth/features/credentials/dto/sign-up.dto.ts"
+export class SignUpDto {
++  name!: string;
++  email!: string;
++  password!: string;
+}
+```
+
+Update `sign-in.dto.ts`:
+
+```diff lang="typescript" title="src/brkpt-auth/features/credentials/dto/sign-in.dto.ts"
+export class SignInDto {
++  email!: string;
++  password!: string;
+}
+```
+
+<Aside type="note">
+  This guide uses `email` as the unique account identifier. Your own credentials flow can use a username, phone number, or any other identifier.
+</Aside>
+
+**Install bcrypt**
+
+This guide uses `bcrypt` to hash and verify passwords:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add bcrypt
+pnpm add -D @types/bcrypt
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install bcrypt
+npm install -D @types/bcrypt
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn add bcrypt
+yarn add -D @types/bcrypt
+```
+
+  </TabItem>
+</Tabs>
+
+**Implement `CredentialsAdapter`**
+
+Create `credentials.adapter.ts`:
+
+```typescript title="src/brkpt-auth/adapters/credentials.adapter.ts"
+import { Injectable } from '@nestjs/common';
+import * as bcrypt from 'bcrypt';
+
+import { MemoryUserRepository } from '../../user/repositories/memory-user.repository';
+import { User } from '../../user/user.entity';
+import { CredentialsPort } from '../features/credentials/credentials.port';
+import { SignInDto } from '../features/credentials/dto/sign-in.dto';
+import { SignUpDto } from '../features/credentials/dto/sign-up.dto';
+
+@Injectable()
+export class CredentialsAdapter implements CredentialsPort<User> {
+  constructor(private readonly userRepo: MemoryUserRepository) {}
+
+  findUserByDto(dto: SignInDto | SignUpDto): Promise<User | null> {
+    return this.userRepo.findOne((u) => u.email === dto.email);
+  }
+
+  validatePassword(user: User, dto: SignInDto): Promise<boolean> {
+    return bcrypt.compare(dto.password, user.password);
+  }
+
+  async createUser(dto: SignUpDto): Promise<User> {
+    const password = await bcrypt.hash(dto.password, 10);
+    return this.userRepo.create({
+      name: dto.name,
+      email: dto.email,
+      password: password,
+    });
+  }
+
+  extractUserIdFromUser(user: User): number {
+    return user.id;
+  }
+}
+```
+
+The password strategy is fully controlled by the adapter. You can replace `bcrypt` with `argon2` or any other hashing library by changing `validatePassword` and `createUser`.
+
+**Register the feature**
+
+Update `features.ts` and pass `CredentialsAdapter` to `credentialsFeature`:
+
+```typescript title="src/brkpt-auth/features.ts" ins="CredentialsAdapter"
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  credentialsFeature(CredentialsAdapter),
+];
+```
+
+`CredentialsAdapter` uses the same `MemoryUserRepository`, so no additional module import is needed.
+
+## Validate request data
+
+brkpt-auth does not force a validation library. This guide uses the standard NestJS `ValidationPipe` with `class-validator`.
+
+**Install validation dependencies**
+
+Install the dependencies:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add class-validator class-transformer
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install class-validator class-transformer
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn add class-validator class-transformer
+```
+
+  </TabItem>
+</Tabs>
+
+**Enable `ValidationPipe`**
+
+Enable the global validation pipe in `main.ts`:
+
+```diff lang="typescript" title="src/main.ts"
++import { ValidationPipe } from '@nestjs/common';
+import { NestFactory } from '@nestjs/core';
+import cookieParser from 'cookie-parser';
+
+import { AppModule } from './app.module';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  app.use(cookieParser());
++  app.useGlobalPipes(
++    new ValidationPipe({
++      whitelist: true,
++      forbidNonWhitelisted: true,
++      transform: true,
++    }),
++  );
+  await app.listen(process.env.PORT ?? 3000);
+}
+void bootstrap();
+```
+
+**Validate the DTOs**
+
+Add validation decorators to `sign-up.dto.ts`:
+
+```diff lang="typescript" title="src/brkpt-auth/features/credentials/dto/sign-up.dto.ts"
++import { IsEmail, IsString, MinLength } from 'class-validator';
+
+export class SignUpDto {
++  @IsString()
+  name!: string;
+
++  @IsEmail()
+  email!: string;
+
++  @IsString()
++  @MinLength(6)
+  password!: string;
+}
+```
+
+Add validation decorators to `sign-in.dto.ts`:
+
+```diff lang="typescript" title="src/brkpt-auth/features/credentials/dto/sign-in.dto.ts"
++import { IsEmail, IsString } from 'class-validator';
+
+export class SignInDto {
++  @IsEmail()
+  email!: string;
+
++  @IsString()
+  password!: string;
+}
+```
+
+## Run and verify
+
+Start the application:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+The following endpoints are now available:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/auth/sign-up` | Create a user |
+| `POST` | `/auth/sign-in` | Sign in |
+| `POST` | `/auth/sign-out` | Sign out |
+| `POST` | `/auth/refresh` | Issue a new access token |
+| `GET` | `/auth/me` | Return the current user |
+
+Use any HTTP client, such as Postman, Bruno, or Insomnia, to test the endpoints.
+
+**Sign up**
+
+Send a sign-up request:
+
+```http
+POST /auth/sign-up
+Content-Type: application/json
+
+{
+  "name": "Kevin",
+  "email": "kevin@example.com",
+  "password": "password123"
+}
+```
+
+The response includes an `accessToken` and sets the refresh token as an HttpOnly cookie.
+
+**Sign in**
+
+Send a sign-in request with the same account:
+
+```http
+POST /auth/sign-in
+Content-Type: application/json
+
+{
+  "email": "kevin@example.com",
+  "password": "password123"
+}
+```
+
+Like sign-up, the response includes an `accessToken` and sets the refresh token as an HttpOnly cookie.
+
+**Get the current user**
+
+Call `/auth/me` with the access token:
+
+```http
+GET /auth/me
+Authorization: Bearer <access-token>
+```
+
+The response returns the current user without the password field.
+
+**Refresh the access token**
+
+Call `/auth/refresh` with the refresh token cookie set by sign-up or sign-in:
+
+```http
+POST /auth/refresh
+Cookie: refreshToken=<refresh-token>
+```
+
+The response includes a new `accessToken`.
+
+**Sign out**
+
+Call `/auth/sign-out` with the access token:
+
+```http
+POST /auth/sign-out
+Authorization: Bearer <access-token>
+```
+
+In `cookie` transport mode, sign-out clears the refresh token cookie if it is present.
+
+<Aside type="note">
+  Make sure your HTTP client keeps the cookie returned by sign-up or sign-in. In Bruno, Postman, or Insomnia, this is usually handled by the client cookie store.
+</Aside>
+
+<Aside type="note">
+  Access tokens remain valid until they expire. This is the normal behavior of stateless JWT authentication. If you need immediate access token revocation, continue to [Add blacklist](../add-blacklist/).
+</Aside>
+
+<Aside type="note">
+  This guide uses in-memory storage. Restarting the application clears all users. Continue to [Use Prisma](../use-prisma/) to use a persistent database.
+</Aside>
+
+## Next steps
+
+Continue through the guides in order to replace the in-memory repository, add session management, and extend your authentication flow feature by feature.

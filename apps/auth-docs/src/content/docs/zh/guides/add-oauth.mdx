@@ -1,0 +1,322 @@
+---
+title: 添加 OAuth
+description: 添加 Google 和 GitHub 的 OAuth 登录。
+sidebar:
+  order: 5
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+本指南承接添加 Blacklist，添加 `oauth` 功能。
+
+`oauth` 功能让用户可以通过 Google、GitHub 这样的 OAuth 提供商登录。和其他登录方式一样，OAuth 登录使用相同的用户模型和 JWT 流程。
+
+本指南使用 `email` 作为账号标识符。如果邮箱已存在，就登录该用户；如果不存在，就先创建一个新用户。
+
+完成本指南后，你的应用将支持：
+
+- `POST /auth/oauth/google`
+- `POST /auth/oauth/github`
+
+## 前置条件
+
+- 已完成[添加 Blacklist](../add-blacklist/)的项目
+- Google 和 GitHub 的 OAuth client ID 与 client secret
+
+<Aside type="note">
+  本指南假设你已经在 Google 和 GitHub 注册好了 OAuth 应用。请参考各提供商的官方文档创建应用，并复制 client ID 和 client secret。
+</Aside>
+
+## 添加 OAuth 功能
+
+**添加功能**
+
+运行 CLI 命令：
+
+```bash
+brkpt auth add oauth --driver google,github
+```
+
+<Aside type="note">
+  在 brkpt-auth 中，适配器负责把一个功能接入你的应用，驱动则代表该功能可以支持的具体选择。每个功能注册一个适配器，可以注册多个驱动。在 `oauth` 功能中，`GoogleOAuthDriver` 和 `GithubOAuthDriver` 分别包含通过 Google 和 GitHub 登录的校验逻辑。
+</Aside>
+
+CLI 会添加一个新的 `features/oauth/` 文件夹，包含所选驱动的文件。
+
+如果某个驱动需要额外依赖，请按照 CLI 显示的依赖提示操作。例如，Google 驱动依赖 `google-auth-library`。
+
+<Aside type="tip">
+  你也可以直接运行 `brkpt auth add oauth`，在交互式界面中选择驱动。
+</Aside>
+
+**配置提供商凭证**
+
+把提供商的 client ID 和 client secret 添加到已有的 `.env` 文件中：
+
+```bash title=".env"
+GOOGLE_CLIENT_ID="your-google-client-id"
+GOOGLE_CLIENT_SECRET="your-google-client-secret"
+GITHUB_CLIENT_ID="your-github-client-id"
+GITHUB_CLIENT_SECRET="your-github-client-secret"
+```
+
+**配置 BrkptAuthModule**
+
+在 `BrkptAuthModule.forRootAsync` 中添加 `oauth` 配置：
+
+```diff lang="typescript" title="src/app.module.ts"
+ BrkptAuthModule.forRootAsync({
+   imports: [ConfigModule],
+   inject: [ConfigService],
+   useFactory: (config: ConfigService) => ({
+     jwt: {
+       // ...
+     },
++    oauth: {
++      google: {
++        clientId: config.getOrThrow('GOOGLE_CLIENT_ID'),
++        clientSecret: config.getOrThrow('GOOGLE_CLIENT_SECRET'),
++      },
++      github: {
++        clientId: config.getOrThrow('GITHUB_CLIENT_ID'),
++        clientSecret: config.getOrThrow('GITHUB_CLIENT_SECRET'),
++      },
++    },
+   }),
+ }),
+```
+
+**定义并校验 DTO**
+
+`oauth` 功能默认生成空的 DTO。请求体会被传给由 `:provider` 路由参数选中的驱动。
+
+在本指南中，`/auth/oauth/google` 使用 `GoogleOAuthDriver`，其 `verify` 方法读取 `idToken`；`/auth/oauth/github` 使用 `GithubOAuthDriver`，其 `verify` 方法读取 `code`。
+
+把这些字段加入 DTO：
+
+```diff lang="typescript" title="src/brkpt-auth/features/oauth/dto/oauth.dto.ts"
++import { IsOptional, IsString } from 'class-validator';
+
+export class OAuthDto {
++  @IsOptional()
++  @IsString()
++  idToken?: string;
++
++  @IsOptional()
++  @IsString()
++  code?: string;
+}
+```
+
+字段名必须和所选驱动在其 `verify` 方法中读取的字段一致。由于 Google 和 GitHub 共用这个 DTO，这里两个字段都是可选的，具体哪个是必填由所选驱动决定。
+
+**定义用户画像类型**
+
+不同提供商返回的用户数据结构不同。在 `adapters/types.ts` 中添加 `UserProfile`，让适配器在查找或创建用户之前先把这些数据归一化：
+
+```typescript title="src/brkpt-auth/adapters/types.ts"
+export interface UserProfile {
+  name: string;
+  email: string;
+}
+```
+
+**实现 `OAuthAdapter`**
+
+OAuth 适配器把提供商数据转换成 `UserProfile`，然后查找或创建用户。
+
+创建 `oauth.adapter.ts`，实现基于 Prisma 的 OAuth 适配器：
+
+<FileTree>
+- src/
+  - brkpt-auth/
+    - adapters/
+      - oauth.adapter.ts
+</FileTree>
+
+```typescript title="src/brkpt-auth/adapters/oauth.adapter.ts"
+import { BadRequestException, Injectable } from '@nestjs/common';
+import { TokenPayload } from 'google-auth-library';
+
+import { User } from '../../../generated/prisma/client';
+import { PrismaService } from '../../prisma/prisma.service';
+import { OAuthPort } from '../features/oauth/oauth.port';
+import { UserProfile } from './types';
+
+interface GoogleUser extends TokenPayload {
+  name: string;
+  email: string;
+}
+
+interface GitHubUser {
+  id: number;
+  login: string;
+  name: string | null;
+  email: string | null;
+}
+
+@Injectable()
+export class OAuthAdapter implements OAuthPort<User, UserProfile> {
+  constructor(private readonly prisma: PrismaService) {}
+
+  mapRawToProfile(provider: string, raw: unknown): UserProfile | undefined {
+    switch (provider) {
+      case 'google': {
+        const r = raw as GoogleUser;
+        if (!r.email) {
+          throw new BadRequestException(
+            'Google profile does not include an email address',
+          );
+        }
+        return { name: r.name, email: r.email };
+      }
+      case 'github': {
+        const r = raw as GitHubUser;
+        if (!r.email) {
+          throw new BadRequestException(
+            'GitHub profile does not include an email address',
+          );
+        }
+        return { name: r.name ?? r.login, email: r.email ?? '' };
+      }
+    }
+  }
+
+  async findOrCreateUserByProfile(
+    profile: UserProfile,
+  ): Promise<{ user: User; created: boolean }> {
+    const existing = await this.prisma.user.findUnique({
+      where: { email: profile.email },
+    });
+    if (existing) {
+      return { user: existing, created: false };
+    }
+
+    const user = await this.prisma.user.create({
+      data: {
+        name: profile.name,
+        email: profile.email,
+        password: '',
+      },
+    });
+
+    return { user, created: true };
+  }
+
+  extractUserIdFromUser(user: User): number {
+    return user.id;
+  }
+}
+```
+
+本指南延续之前几篇指南的账号模型：用 `email` 标识用户。OAuth 适配器用这个邮箱来登录已有用户，或者创建新用户。你可以为自己的应用调整这个匹配逻辑。
+
+<Aside type="note">
+  本指南中，通过 OAuth 创建的用户密码字段存的是空字符串。这不代表可以用空密码登录：credentials 登录仍然会用 `bcrypt.compare` 校验提交的密码，而存储的空值并不是空密码的 bcrypt 哈希。后续功能可以让这些用户设置或重置密码，从而也能用邮箱和密码登录。
+</Aside>
+
+<Aside type="tip">
+  在生产环境中，你可能更倾向于用可为空的密码字段表示无密码账号，而不是空字符串。密码具体如何存储由适配器控制。
+</Aside>
+
+<Aside type="note">
+  本指南要求提供邮箱地址，因为 `email` 被用作账号标识符。如果提供商返回的数据不包含邮箱，适配器会拒绝这次登录请求，而不是创建一个数据不完整的用户。
+</Aside>
+
+**注册功能**
+
+更新 `features.ts`，把 `OAuthAdapter` 和驱动类传给 `oauthFeature`：
+
+```typescript title="src/brkpt-auth/features.ts" ins="OAuthAdapter" ins="GoogleOAuthDriver" ins="GithubOAuthDriver"
+import { BlacklistAdapter } from './adapters/blacklist.adapter';
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { OAuthAdapter } from './adapters/oauth.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { blacklistFeature } from './features/blacklist/blacklist.feature';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { GoogleOAuthDriver } from './features/oauth/drivers/google.driver';
+import { GithubOAuthDriver } from './features/oauth/drivers/github.driver';
+import { oauthFeature } from './features/oauth/oauth.feature';
+import { sessionFeature } from './features/session/session.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  blacklistFeature(BlacklistAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+  oauthFeature(OAuthAdapter, GoogleOAuthDriver, GithubOAuthDriver),
+];
+```
+
+只有传给 `oauthFeature` 的驱动才会被启用。你可以在项目中保留某个驱动文件而不在这里启用它。
+
+## 运行并验证
+
+启动应用：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+`oauth` 功能新增一个基于提供商的端点：
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/auth/oauth/:provider` | 通过某个 OAuth 提供商登录 |
+
+`:provider` 的值必须匹配一个已启用的驱动，比如 `google` 或 `github`。
+
+**Google**
+
+从你的前端或临时测试流程获取一个 Google `idToken`，然后发送给服务端：
+
+```http
+POST /auth/oauth/google
+Content-Type: application/json
+
+{
+  "idToken": "<google-id-token>"
+}
+```
+
+**GitHub**
+
+从你的前端或临时测试流程获取一个 GitHub 授权 `code`，然后发送给服务端：
+
+```http
+POST /auth/oauth/github
+Content-Type: application/json
+
+{
+  "code": "<github-code>"
+}
+```
+
+如果邮箱已存在，请求会登录该用户；如果不存在，会先创建一个新用户。两种情况返回的令牌结果和其他登录方式一样。
+
+<Aside type="note">
+  没有前端时，你需要先获取一个真实的 Google `idToken` 或 GitHub `code`，才能调用这些端点。本地测试流程见[本地测试 Google OAuth](../../recipes/test-google-oauth-locally/)和[本地测试 GitHub OAuth](../../recipes/test-github-oauth-locally/)。
+</Aside>

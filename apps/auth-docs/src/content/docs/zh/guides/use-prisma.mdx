@@ -1,0 +1,395 @@
+---
+title: 使用 Prisma
+description: 用 Prisma 和 PostgreSQL 替换内存用户 repository。
+sidebar:
+  order: 2
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+本指南承接开始使用，用 Prisma 和 PostgreSQL 替换内存用户 repository。
+
+完成本指南后，通过 `/auth/sign-up` 创建的用户会存储在持久化数据库中，而不是内存里。
+
+## 前置条件
+
+- 已完成[开始使用](../get-started/)的项目
+- 一个 PostgreSQL 数据库
+
+## 安装 Prisma
+
+安装 Prisma、Prisma Client、PostgreSQL 驱动适配器和 `pg`：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm add -D prisma
+pnpm add @prisma/client @prisma/adapter-pg pg
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm install -D prisma
+npm install @prisma/client @prisma/adapter-pg pg
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn add -D prisma
+yarn add @prisma/client @prisma/adapter-pg pg
+```
+
+  </TabItem>
+</Tabs>
+
+## 初始化 Prisma
+
+在项目根目录运行 Prisma 初始化命令：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm dlx prisma init --output ../generated/prisma
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npx prisma init --output ../generated/prisma
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn dlx prisma init --output ../generated/prisma
+```
+
+  </TabItem>
+</Tabs>
+
+这会创建一个 `prisma/schema.prisma` 文件，并配置生成的 Prisma Client 输出路径。
+
+## 配置数据库连接
+
+把 `DATABASE_URL` 添加到已有的 `.env` 文件中：
+
+```bash title=".env"
+DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/DB_NAME?schema=public"
+```
+
+把 `USER`、`PASSWORD` 和 `DB_NAME` 替换成你的 PostgreSQL 用户名、密码和数据库名。
+
+## 定义用户模型
+
+更新 `prisma/schema.prisma`：
+
+```diff lang="prisma" title="prisma/schema.prisma"
+generator client {
+  provider     = "prisma-client"
+  output       = "../generated/prisma"
++  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
++model User {
++  id       Int    @id @default(autoincrement())
++  name     String
++  email    String @unique
++  password String
++}
+```
+
+<Aside type="note">
+  `moduleFormat = "cjs"` 选项让生成的 client 保持与本指南默认使用的 CommonJS 配置兼容。
+</Aside>
+
+这个 `User` 模型和开始使用中的示例用户结构一致。brkpt-auth 并不要求这个具体的模型，你的适配器决定哪些字段用于 JWT 载荷、密码校验和安全的用户响应。
+
+## 运行迁移
+
+创建并应用初始迁移：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm dlx prisma migrate dev --name init
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npx prisma migrate dev --name init
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn dlx prisma migrate dev --name init
+```
+
+  </TabItem>
+</Tabs>
+
+然后生成 Prisma Client：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm dlx prisma generate
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npx prisma generate
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn dlx prisma generate
+```
+
+  </TabItem>
+</Tabs>
+
+## 创建 PrismaModule
+
+创建以下文件：
+
+<FileTree>
+- src/
+  - prisma/
+    - prisma.module.ts
+    - prisma.service.ts
+</FileTree>
+
+**创建 `PrismaService`**
+
+创建 `prisma.service.ts`，包装生成的 `PrismaClient`：
+
+```typescript title="src/prisma/prisma.service.ts"
+import { Injectable } from '@nestjs/common';
+import { PrismaPg } from '@prisma/adapter-pg';
+
+import { PrismaClient } from '../../generated/prisma/client';
+
+@Injectable()
+export class PrismaService extends PrismaClient {
+  constructor() {
+    const adapter = new PrismaPg({
+      connectionString: process.env.DATABASE_URL as string,
+    });
+
+    super({ adapter });
+  }
+}
+```
+
+**创建 `PrismaModule`**
+
+创建 `prisma.module.ts`，导出 `PrismaService` 以便适配器可以注入它：
+
+```typescript title="src/prisma/prisma.module.ts"
+import { Module } from '@nestjs/common';
+
+import { PrismaService } from './prisma.service';
+
+@Module({
+  providers: [PrismaService],
+  exports: [PrismaService],
+})
+export class PrismaModule {}
+```
+
+## 用 PrismaModule 替换 UserModule
+
+在开始使用中，`BrkptAuthModule` 导入了 `UserModule`，让适配器可以注入 `MemoryUserRepository`。
+
+现在把 `UserModule` 替换成 `PrismaModule`：
+
+```diff lang="typescript" title="src/brkpt-auth/brkpt-auth.module.ts"
+-import { UserModule } from '../user/user.module';
++import { PrismaModule } from '../prisma/prisma.module';
+
+ @Module({
+-  imports: [UserModule],
++  imports: [PrismaModule],
+   controllers: [...features.flatMap((f) => f.controllers)],
+   providers: [...features.flatMap((f) => f.providers)],
+ })
+ export class BrkptAuthModule {
+   // ...
+ }
+```
+
+<Aside type="note">
+  有些 NestJS 项目会全局注册 `PrismaModule`。本指南把 `PrismaModule` 直接导入 `BrkptAuthModule`，让适配器的依赖关系保持明确。如果你的应用已经全局提供了 `PrismaService`，就不需要在这里再添加 `PrismaModule`。
+</Aside>
+
+## 更新适配器
+
+brkpt-auth 的功能本身不需要改动，只需要把适配器从 `MemoryUserRepository` 改为使用 `PrismaService`。
+
+**更新 `CoreAdapter`**
+
+把 `CoreAdapter` 改为使用 `PrismaService`：
+
+```typescript title="src/brkpt-auth/adapters/core.adapter.ts"
+import { Injectable } from '@nestjs/common';
+
+import { User } from '../../../generated/prisma/client';
+import { PrismaService } from '../../prisma/prisma.service';
+import { CorePort } from '../features/core/core.port';
+import { AuthJwtPayload } from './types';
+
+@Injectable()
+export class CoreAdapter implements CorePort<User> {
+  constructor(private readonly prisma: PrismaService) {}
+
+  mapUserToJwtPayload(user: User): AuthJwtPayload {
+    return {
+      sub: user.id,
+      email: user.email,
+    };
+  }
+
+  shrinkJwtPayload(payload: AuthJwtPayload): Record<string, unknown> {
+    return {
+      sub: payload.sub,
+    };
+  }
+
+  findUserByJwtPayload(payload: AuthJwtPayload): Promise<User | null> {
+    return this.prisma.user.findUnique({
+      where: {
+        id: payload.sub,
+      },
+    });
+  }
+
+  toSafeUser(user: User): Record<string, unknown> {
+    const { password: _password, ...safe } = user;
+    return safe;
+  }
+
+  extractUserIdFromJwtPayload(payload: AuthJwtPayload): number {
+    return payload.sub;
+  }
+}
+```
+
+**更新 `CredentialsAdapter`**
+
+把 `CredentialsAdapter` 改为使用 `PrismaService`：
+
+```typescript title="src/brkpt-auth/adapters/credentials.adapter.ts"
+import { Injectable } from '@nestjs/common';
+import * as bcrypt from 'bcrypt';
+
+import { User } from '../../../generated/prisma/client';
+import { PrismaService } from '../../prisma/prisma.service';
+import { CredentialsPort } from '../features/credentials/credentials.port';
+import { SignInDto } from '../features/credentials/dto/sign-in.dto';
+import { SignUpDto } from '../features/credentials/dto/sign-up.dto';
+
+@Injectable()
+export class CredentialsAdapter implements CredentialsPort<User> {
+  constructor(private readonly prisma: PrismaService) {}
+
+  findUserByDto(dto: SignInDto | SignUpDto): Promise<User | null> {
+    return this.prisma.user.findUnique({
+      where: {
+        email: dto.email,
+      },
+    });
+  }
+
+  validatePassword(user: User, dto: SignInDto): Promise<boolean> {
+    return bcrypt.compare(dto.password, user.password);
+  }
+
+  async createUser(dto: SignUpDto): Promise<User> {
+    const password = await bcrypt.hash(dto.password, 10);
+    return this.prisma.user.create({
+      data: {
+        name: dto.name,
+        email: dto.email,
+        password,
+      },
+    });
+  }
+
+  extractUserIdFromUser(user: User): number {
+    return user.id;
+  }
+}
+```
+
+<Aside type="note">
+  Prisma 会从 `schema.prisma` 生成 `User` 类型，所以适配器不再需要开始使用中手动定义的 `src/user/user.entity.ts` 类型。
+</Aside>
+
+## 移除内存用户模块
+
+现在可以移除开始使用中创建的 `src/user/` 文件夹：
+
+<FileTree>
+- src/
+  - user/
+    - repositories/
+      - memory-user.repository.ts
+    - user.entity.ts
+    - user.module.ts
+</FileTree>
+
+这个文件夹的唯一作用就是为内存示例提供 `MemoryUserRepository`。把适配器切换到 `PrismaService` 之后，它就不再被使用了。
+
+## 运行并验证
+
+启动应用：
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+通过 `/auth/sign-up` 创建一个用户，重启服务，再用同一个账号登录。
+
+登录请求应该仍然能成功，因为用户现在存储在 PostgreSQL 中。

@@ -1,0 +1,286 @@
+---
+title: Audit
+description: Record important authentication and account events from enabled brkpt-auth features.
+sidebar:
+  order: 11
+---
+
+import { FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This guide adds the `audit` feature.
+
+Other brkpt-auth features emit events for important authentication and account actions. The `audit` feature listens to these events and passes them to your adapter, where you can log, store, or process them for auditing.
+
+## Add the audit feature
+
+**Add the feature**
+
+Run the CLI command:
+
+```bash
+brkpt auth add audit
+```
+
+The CLI adds a new `features/audit/` folder.
+
+**Implement the adapter**
+
+Create an adapter that handles the audit events emitted by the enabled features:
+
+<FileTree>
+
+- src/
+  - brkpt-auth/
+    - adapters/
+      - audit.adapter.ts
+
+</FileTree>
+
+This example writes structured audit records to the console. In a real application, the adapter can send them to a database, logging service, or another audit destination.
+
+```typescript title="src/brkpt-auth/adapters/audit.adapter.ts"
+import { Injectable } from '@nestjs/common';
+
+import {
+  ChangePasswordEvent,
+  ResetPasswordEvent,
+  SessionAnomalyEvent,
+  SessionManualRevokeEvent,
+  SessionManualRevokeOthersEvent,
+  SignInEvent,
+  SignOutEvent,
+  SignUpEvent,
+  UserDeleteEvent,
+  VerifyEmailEvent,
+} from '../common/interfaces';
+import { AuditPort } from '../features/audit/audit.port';
+
+@Injectable()
+export class AuditAdapter implements AuditPort {
+  private log(event: string, fields: Record<string, unknown>) {
+    console.log(
+      JSON.stringify({
+        logger: 'brkpt-auth:audit',
+        event,
+        ...fields,
+      }),
+    );
+  }
+
+  handleSignUp({
+    userId,
+    feature,
+    timestamp,
+    metadata,
+  }: SignUpEvent): Promise<void> | void {
+    this.log('sign_up', {
+      userId: String(userId),
+      feature,
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleSignIn({ userId, feature, timestamp, metadata }: SignInEvent) {
+    this.log('sign_in', {
+      userId: String(userId),
+      feature,
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleSignOut({ userId, timestamp, metadata }: SignOutEvent) {
+    this.log('sign_out', {
+      userId: String(userId),
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleVerifyEmail({ userId, timestamp, metadata }: VerifyEmailEvent) {
+    this.log('verify_email', {
+      userId: String(userId),
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleChangePassword({ userId, timestamp, metadata }: ChangePasswordEvent) {
+    this.log('change_password', {
+      userId: String(userId),
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleResetPassword({ userId, timestamp, metadata }: ResetPasswordEvent) {
+    this.log('reset_password', {
+      userId: String(userId),
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleSessionAnomaly({
+    sessionId,
+    userId,
+    type,
+    previous,
+    current,
+  }: SessionAnomalyEvent) {
+    this.log('session_anomaly', {
+      sessionId,
+      userId: String(userId),
+      type,
+      message: `${type}: ${previous} → ${current}`,
+    });
+  }
+
+  handleSessionManualRevoke({
+    sessionId,
+    userId,
+    timestamp,
+    metadata,
+  }: SessionManualRevokeEvent) {
+    this.log('session_manual_revoke', {
+      sessionId,
+      userId: String(userId),
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleSessionManualRevokeOthers({
+    userId,
+    timestamp,
+    metadata,
+  }: SessionManualRevokeOthersEvent) {
+    this.log('session_manual_revoke_others', {
+      userId: String(userId),
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+
+  handleUserDelete({ userId, timestamp, metadata }: UserDeleteEvent) {
+    this.log('user_delete', {
+      userId: String(userId),
+      timestamp: new Date(timestamp).toISOString(),
+      metadata,
+    });
+  }
+}
+```
+
+**Register the feature**
+
+Update `features.ts` and pass `AuditAdapter` to `auditFeature`:
+
+```typescript title="src/brkpt-auth/features.ts" ins="AuditAdapter"
+import { AuditAdapter } from './adapters/audit.adapter';
+import { BlacklistAdapter } from './adapters/blacklist.adapter';
+import { ChangePasswordAdapter } from './adapters/change-password.adapter';
+import { CoreAdapter } from './adapters/core.adapter';
+import { CredentialsAdapter } from './adapters/credentials.adapter';
+import { MagicLinkAdapter } from './adapters/magic-link.adapter';
+import { OAuthAdapter } from './adapters/oauth.adapter';
+import { OtpAdapter } from './adapters/otp.adapter';
+import { ResetPasswordAdapter } from './adapters/reset-password.adapter';
+import { SessionAdapter } from './adapters/session.adapter';
+import { VerifyEmailAdapter } from './adapters/verify-email.adapter';
+import { FeatureConfig } from './common/interfaces';
+import { auditFeature } from './features/audit/audit.feature';
+import { blacklistFeature } from './features/blacklist/blacklist.feature';
+import { changePasswordFeature } from './features/change-password/change-password.feature';
+import { coreFeature } from './features/core/core.feature';
+import { credentialsFeature } from './features/credentials/credentials.feature';
+import { EmailMagicLinkDriver } from './features/magic-link/drivers/email.driver';
+import { magicLinkFeature } from './features/magic-link/magic-link.feature';
+import { GithubOAuthDriver } from './features/oauth/drivers/github.driver';
+import { GoogleOAuthDriver } from './features/oauth/drivers/google.driver';
+import { oauthFeature } from './features/oauth/oauth.feature';
+import { EmailOtpDriver } from './features/otp/drivers/email.driver';
+import { otpFeature } from './features/otp/otp.feature';
+import { resetPasswordFeature } from './features/reset-password/reset-password.feature';
+import { sessionFeature } from './features/session/session.feature';
+import { verifyEmailFeature } from './features/verify-email/verify-email.feature';
+
+export const features: FeatureConfig[] = [
+  coreFeature(CoreAdapter),
+  blacklistFeature(BlacklistAdapter),
+  verifyEmailFeature(VerifyEmailAdapter),
+  credentialsFeature(CredentialsAdapter),
+  sessionFeature(SessionAdapter),
+  oauthFeature(OAuthAdapter, GoogleOAuthDriver, GithubOAuthDriver),
+  otpFeature(OtpAdapter, EmailOtpDriver),
+  magicLinkFeature(MagicLinkAdapter, EmailMagicLinkDriver),
+  changePasswordFeature(ChangePasswordAdapter),
+  resetPasswordFeature(ResetPasswordAdapter),
+  auditFeature(AuditAdapter),
+];
+```
+
+## Run and verify
+
+Start the application:
+
+<Tabs>
+  <TabItem label="pnpm">
+
+```bash
+pnpm start:dev
+```
+
+  </TabItem>
+
+  <TabItem label="npm">
+
+```bash
+npm run start:dev
+```
+
+  </TabItem>
+
+  <TabItem label="yarn">
+
+```bash
+yarn start:dev
+```
+
+  </TabItem>
+</Tabs>
+
+The `audit` feature does not add an endpoint. Instead, it records supported events produced by other enabled features.
+
+**Record an audit event**
+
+Sign in using credentials:
+
+```http
+POST /auth/sign-in
+Content-Type: application/json
+
+{
+  "email": "kevin@example.com",
+  "password": "password"
+}
+```
+
+After a successful sign-in, the adapter writes an audit record like:
+
+```json
+{
+  "logger": "brkpt-auth:audit",
+  "event": "sign_in",
+  "userId": "1",
+  "feature": "credentials",
+  "timestamp": "2026-08-09T12:34:56.789Z",
+  "metadata": {
+    "userAgent": "example-client/1.0",
+    "ip": "127.0.0.1"
+  }
+}
+```
+
+Other supported actions, including sign-up, sign-out, email verification, password changes, session management, and user deletion, are passed to the adapter in the same way.
