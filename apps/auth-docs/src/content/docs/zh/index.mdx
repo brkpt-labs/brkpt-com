@@ -4,13 +4,14 @@ description: 面向 NestJS 的透明、可组合、可移植的六边形架构�
 template: splash
 
 hero:
-  tagline: 用完全属于你自己的源代码，为 NestJS 构建身份验证。设计上就是透明、可组合、可移植的六边形架构。
+  tagline: 用完全属于你自己的源代码，为 NestJS 构建身份验证。设计上透明、可组合、可移植，采用六边形架构。
   announcement:
     text: v0.1.0 现已发布
-    link: https://github.com/brkpt-labs/brkpt-auth
+    link: https://github.com/brkpt-labs/brkpt-auth/releases
   actions:
     - text: 开始使用
       link: /auth/zh/guides/get-started/
+      icon: right-arrow
     - text: 源代码
       link: https://github.com/brkpt-labs/brkpt-auth
       variant: minimal
@@ -18,8 +19,6 @@ hero:
 
 import { Card, CardGrid, Steps } from "@astrojs/starlight/components";
 import { ContainerSection } from "lucode-starlight/components";
-
-<div class="auth-splash">
 
 <ContainerSection>
 
@@ -248,5 +247,3 @@ brkpt-auth 面向需要一套可拥有、可适配、并能随时间演进的身
 </CardGrid>
 
 </ContainerSection>
-
-</div>

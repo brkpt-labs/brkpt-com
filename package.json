@@ -3,7 +3,16 @@
   "private": true,
   "scripts": {
     "dev:auth": "pnpm --filter auth-docs dev",
+    "dev:cli": "pnpm --filter cli-docs dev",
+    "dev:main": "pnpm --filter main-site dev",
     "build:auth": "pnpm --filter auth-docs build",
-    "preview:auth": "pnpm --filter auth-docs preview"
+    "build:cli": "pnpm --filter cli-docs build",
+    "build:main": "pnpm --filter main-site build",
+    "build": "pnpm --filter main-site build && pnpm --filter auth-docs build && pnpm --filter cli-docs build",
+    "preview:auth": "pnpm --filter auth-docs preview",
+    "preview:cli": "pnpm --filter cli-docs preview",
+    "preview:main": "pnpm --filter main-site preview",
+    "combine": "node scripts/combine-dist.mjs",
+    "deploy:build": "pnpm build && pnpm combine"
   }
 }

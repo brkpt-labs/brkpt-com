@@ -1,0 +1,21 @@
+---
+title: Auth
+description: brkpt auth 命令参考。
+---
+
+## `brkpt auth init`
+
+将 brkpt-auth 安装到当前项目。
+
+| 参数 | 说明 |
+|---|---|
+| `--common` | 仅安装 `common/` 文件。 |
+| `--module` | 仅安装 `brkpt-auth.module.ts`。 |
+
+## `brkpt auth add [feature]`
+
+安装指定功能并将其注册到 `features.ts`。省略 `feature` 时会弹出交互式列表供选择。
+
+| 参数 | 说明 |
+|---|---|
+| `--driver <names>` | 逗号分隔的驱动名称列表。若该功能支持多个驱动且未指定，会弹出交互式列表供选择。 |

@@ -1,0 +1,35 @@
+---
+title: brkpt-cli
+description: 用于搭建 brkpt 项目的命令行工具。
+template: splash
+
+hero:
+  tagline: 用于搭建 brkpt 项目的命令行工具。
+  announcement:
+    text: v0.1.5 已上线 npm
+    link: https://www.npmjs.com/package/@brkpt/cli
+  actions:
+    - text: 查看文档
+      link: /cli/zh/reference/auth/
+      icon: right-arrow
+    - text: 源代码
+      link: https://github.com/brkpt-labs/brkpt-cli
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+import { ContainerSection } from 'lucode-starlight/components';
+
+<ContainerSection>
+
+## 适用场景
+
+<CardGrid>
+  <Card title="自动化" icon="rocket">
+    搭建并配置 brkpt 项目。
+  </Card>
+  <Card title="社区共建" icon="heart">
+    欢迎在 GitHub 上贡献新功能、驱动或修复。
+  </Card>
+</CardGrid>
+</ContainerSection>

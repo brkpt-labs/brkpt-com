@@ -1,0 +1,34 @@
+---
+import BrkptLogo from './BrkptLogo.astro';
+
+const accentColor = '#06b6d4';
+const logoSize = 22;
+---
+
+<div class='site-title-container'>
+  <a href='/' class='site-title__main-link'>
+    <BrkptLogo accentColor={accentColor} size={logoSize} />
+  </a>
+</div>
+
+<style
+  define:vars={{
+    accentColor,
+    fontSize: `${logoSize}px`,
+    gapSize: `${logoSize * 0.02}rem`,
+  }}
+>
+  .site-title-container {
+    gap: var(--gapSize);
+    align-items: center;
+    display: flex;
+    margin-right: calc(var(--spacing) * 3);
+  }
+
+  .site-title__main-link {
+    display: flex;
+    align-items: center;
+    color: inherit;
+    text-decoration: none;
+  }
+</style>

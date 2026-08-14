@@ -1,0 +1,80 @@
+---
+import SiteTitle from '../components/SiteTitle.astro';
+import '../styles/global.css';
+
+const products = [
+  {
+    name: 'brkpt-auth',
+    description:
+      'Transparent, composable authentication for NestJS. Installed as source, not a black box.',
+    href: '/auth/',
+  },
+  {
+    name: 'brkpt-cli',
+    description: 'The command-line tool that scaffolds brkpt projects.',
+    href: '/cli/',
+  },
+];
+
+const title = 'brkpt — Open-source, composable developer tools for NestJS';
+const description =
+  'brkpt builds composable, portable developer tools for NestJS, starting with brkpt-auth.';
+---
+
+<html lang='en'>
+  <head>
+    <meta charset='utf-8' />
+    <meta name='viewport' content='width=device-width, initial-scale=1' />
+    <title>{title}</title>
+    <meta name='description' content={description} />
+    <link rel='icon' href='/favicon.svg' />
+    <link rel='canonical' href='https://brkpt.com/' />
+    <link rel='preconnect' href='https://fonts.googleapis.com' />
+    <link rel='preconnect' href='https://fonts.gstatic.com' crossorigin />
+    <link
+      href='https://fonts.googleapis.com/css2?family=Source+Sans+3:ital,wght@0,200..900;1,200..900&display=swap'
+      rel='stylesheet'
+    />
+
+    <meta property='og:type' content='website' />
+    <meta property='og:title' content={title} />
+    <meta property='og:description' content={description} />
+    <meta property='og:url' content='https://brkpt.com/' />
+
+    <meta name='twitter:card' content='summary_large_image' />
+    <meta name='twitter:title' content={title} />
+    <meta name='twitter:description' content={description} />
+  </head>
+  <body>
+    <header>
+      <SiteTitle />
+    </header>
+
+    <main>
+      <h1>brkpt builds open-source developer tools for NestJS.</h1>
+      <p class='lede'>
+        Composable, portable, and built to extend. Starting with brkpt-auth.
+      </p>
+
+      <ul class='products'>
+        {
+          products.map((p) => (
+            <li>
+              <a href={p.href}>
+                <span class='name'>
+                  {p.name}
+                  <span class='arrow'>→</span>
+                </span>
+                <span class='description'>{p.description}</span>
+              </a>
+            </li>
+          ))
+        }
+      </ul>
+    </main>
+
+    <footer>
+      <span>brkpt</span> · <a href='https://github.com/brkpt-labs'>GitHub</a>
+    </footer>
+  </body>
+</html>

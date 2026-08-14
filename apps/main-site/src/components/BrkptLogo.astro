@@ -1,0 +1,175 @@
+---
+interface Props {
+  accentColor?: string;
+  primaryColor?: string;
+  mutedColor?: string;
+  size?: number;
+  animated?: boolean;
+}
+
+const {
+  accentColor = '#06b6d4',
+  primaryColor = 'var(--sl-color-text, #484c55)',
+  mutedColor = 'var(--logo-muted, #808c99)',
+  size = 34,
+  animated = false,
+} = Astro.props;
+
+const markW = size * 1.5;
+const markH = size;
+---
+
+<div
+  class:list={['brkpt-logo', 'group', { 'group-animated': animated }]}
+  style={`gap: ${size * 0.4}px;`}
+>
+  <svg
+    width={markW}
+    height={markH}
+    viewBox='0 0 48 32'
+    fill='none'
+    xmlns='http://www.w3.org/2000/svg'
+    class='brkpt-logo__svg'
+  >
+    <line
+      x1='4'
+      y1='6'
+      x2='24'
+      y2='6'
+      stroke={accentColor}
+      stroke-width='6'
+      stroke-linecap='round'></line>
+    <line
+      class='line-flow'
+      x1='4'
+      y1='6'
+      x2='24'
+      y2='6'
+      stroke='white'
+      stroke-width='2'
+      stroke-linecap='round'></line>
+    <line
+      x1='32'
+      y1='6'
+      x2='44'
+      y2='6'
+      stroke={mutedColor}
+      stroke-width='6'
+      stroke-linecap='round'
+      opacity='0.4'></line>
+
+    <circle class='dot-hit' cx='4' cy='16' r='3' fill={accentColor}></circle>
+    <line
+      x1='14'
+      y1='16'
+      x2='44'
+      y2='16'
+      stroke={accentColor}
+      stroke-width='6'
+      stroke-linecap='round'></line>
+    <line
+      class='line-flow line-flow-delayed'
+      x1='14'
+      y1='16'
+      x2='44'
+      y2='16'
+      stroke='white'
+      stroke-width='2'
+      stroke-linecap='round'></line>
+
+    <line
+      x1='4'
+      y1='26'
+      x2='44'
+      y2='26'
+      stroke={mutedColor}
+      stroke-width='6'
+      stroke-linecap='round'
+      opacity='0.4'></line>
+  </svg>
+
+  <span class='brkpt-logo__wordmark' style={`font-size: ${size}px;`}>
+    <span style={`color: ${accentColor}`}>brk</span><span
+      style={`color: ${primaryColor}`}>pt</span
+    >
+  </span>
+</div>
+
+<style is:global>
+  :root[data-theme='light'],
+  html[data-theme='light'] {
+    --logo-muted: var(--sl-color-gray-4);
+  }
+
+  :root[data-theme='dark'],
+  html[data-theme='dark'] {
+    --logo-muted: var(--sl-color-gray-1);
+  }
+</style>
+
+<style>
+  .brkpt-logo {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+  }
+
+  .brkpt-logo__svg {
+    display: block;
+    overflow: visible;
+    flex-shrink: 0;
+  }
+
+  @keyframes flow {
+    0% {
+      stroke-dashoffset: 100;
+    }
+    100% {
+      stroke-dashoffset: -100;
+    }
+  }
+  @keyframes hit {
+    0%,
+    100% {
+      transform: scale(1);
+      opacity: 1;
+    }
+    50% {
+      transform: scale(1.12);
+      opacity: 0.8;
+    }
+  }
+
+  .line-flow {
+    stroke-dasharray: 30 70;
+    opacity: 0;
+    animation: flow 2.5s linear infinite;
+    transition: opacity 0.6s ease;
+  }
+  .line-flow-delayed {
+    animation-delay: -0.4s;
+  }
+  .group:hover .line-flow,
+  .group-animated .line-flow {
+    opacity: 0.6;
+  }
+
+  .dot-hit {
+    transform-box: fill-box;
+    transform-origin: center;
+  }
+  .group:hover .dot-hit,
+  .group-animated .dot-hit {
+    animation: hit 2.5s ease-in-out infinite;
+  }
+
+  .brkpt-logo__wordmark {
+    font-family: 'Source Sans 3';
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: -0.04em;
+    display: flex;
+    align-items: baseline;
+    transition: all 0.3s ease;
+  }
+</style>

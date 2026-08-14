@@ -5,10 +5,10 @@ import lucode from 'lucode-starlight';
 
 // https://astro.build/config
 export default defineConfig({
-  base: '/auth',
+  base: '/cli',
   integrations: [
     starlight({
-      title: 'brkpt-auth',
+      title: 'brkpt-cli',
       favicon: '/favicon.svg',
       head: [
         {
@@ -38,14 +38,14 @@ export default defineConfig({
       plugins: [
         lucode({
           footerText:
-            'brkpt-auth docs · [GitHub](https://github.com/brkpt-labs/brkpt-auth)',
+            'brkpt-cli docs · [GitHub](https://github.com/brkpt-labs/brkpt-cli)',
         }),
       ],
       social: [
         {
           icon: 'github',
           label: 'GitHub',
-          href: 'https://github.com/brkpt-labs/brkpt-auth',
+          href: 'https://github.com/brkpt-labs/brkpt-cli',
         },
       ],
       defaultLocale: 'root',
@@ -55,20 +55,8 @@ export default defineConfig({
       },
       sidebar: [
         {
-          label: 'Guides',
-          items: [{ autogenerate: { directory: 'guides' } }],
-        },
-        {
           label: 'Reference',
           items: [{ autogenerate: { directory: 'reference' } }],
-        },
-        {
-          label: 'Concepts',
-          items: [{ autogenerate: { directory: 'concepts' } }],
-        },
-        {
-          label: 'Recipes',
-          items: [{ autogenerate: { directory: 'recipes' } }],
         },
       ],
     }),

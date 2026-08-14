@@ -1,0 +1,63 @@
+---
+import { getRelativeLocaleUrl } from 'astro:i18n';
+import BrkptLogo from './BrkptLogo.astro';
+const currentLocale = Astro.currentLocale as string;
+
+const mainSiteUrl = import.meta.env.PUBLIC_MAIN_SITE_URL || '/';
+
+const productSuffix = 'cli';
+const accentColor = '#06b6d4';
+const logoSize = 20;
+---
+
+<div class='site-title-container'>
+  <a href={mainSiteUrl} class='site-title__main-link'>
+    <BrkptLogo accentColor={accentColor} size={logoSize} />
+  </a>
+  <a
+    href={getRelativeLocaleUrl(currentLocale, '/')}
+    class='site-title__suffix-link'
+  >
+    <span class='site-title__suffix-text'>{productSuffix}</span>
+  </a>
+</div>
+
+<style
+  define:vars={{
+    accentColor,
+    fontSize: `${logoSize}px`,
+    gapSize: `${logoSize * 0.02}rem`,
+  }}
+>
+  .site-title-container {
+    gap: var(--gapSize);
+    align-items: center;
+    display: flex;
+    margin-right: calc(var(--spacing) * 3);
+  }
+
+  .site-title__main-link,
+  .site-title__suffix-link {
+    display: flex;
+    align-items: center;
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .site-title__suffix-text {
+    font-family: 'Source Sans 3';
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: -0.04em;
+    font-size: var(--fontSize);
+
+    background: linear-gradient(
+      135deg,
+      var(--accentColor) 0%,
+      color-mix(in srgb, var(--accentColor) 60%, #1e40af) 100%
+    );
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+</style>

@@ -1,0 +1,21 @@
+---
+title: Auth
+description: Command reference for brkpt auth.
+---
+
+## `brkpt auth init`
+
+Install brkpt-auth into the current project.
+
+| Flag | Description |
+|---|---|
+| `--common` | Install only the `common/` files. |
+| `--module` | Install only `brkpt-auth.module.ts`. |
+
+## `brkpt auth add [feature]`
+
+Install a feature and register it in `features.ts`. Omit `feature` to choose from an interactive list.
+
+| Flag | Description |
+|---|---|
+| `--driver <names>` | Comma-separated driver names. Omit to choose interactively if the feature has drivers. |
