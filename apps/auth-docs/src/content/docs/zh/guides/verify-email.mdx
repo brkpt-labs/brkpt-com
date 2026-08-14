@@ -11,6 +11,11 @@ import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
 
 `verify-email` 功能要求用户在访问受保护路由之前验证一个邮箱。它把 `otp` 或 `magic-link` 这样的验证功能用作验证策略。这些功能不仅可以用于登录，也可以被其他需要验证账户所有权的流程复用。
 
+## 前置条件
+
+- 已完成[添加魔法链接](../add-magic-link/)的项目
+- 用于发送邮件的 SMTP 凭证
+
 ## 更新用户模型
 
 本指南把已验证的邮箱存储在一个可为空的 `verifiedEmail` 字段中。

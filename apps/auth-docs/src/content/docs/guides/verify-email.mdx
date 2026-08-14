@@ -11,6 +11,11 @@ This guide adds the `verify-email` feature.
 
 The `verify-email` feature lets users verify an email before accessing protected routes. It uses verification features such as `otp` or `magic-link` as verification strategies. These features can be used not only for authentication, but also by other flows that need to verify account ownership.
 
+## Prerequisites
+
+- A project completed from [Add magic link](../add-magic-link/)
+- SMTP credentials for sending emails
+
 ## Update the user model
 
 This guide stores the verified email in a nullable `verifiedEmail` field.
