@@ -13,13 +13,13 @@ This works because of how NestJS's `EventEmitter2` behaves: an emitter can `awai
 
 Looking at brkpt-auth's event names, they fall into two groups depending on what the namespace segment identifies.
 
-**Commands**, where the namespace names the module that should act on the event:
+**Commands**, where the namespace names the feature that should act on the event:
 
-- `brkpt-auth.session.revoke` — the `session` module should revoke this session
-- `brkpt-auth.session.revoke-others` — the `session` module should revoke every other session
-- `brkpt-auth.session.validate` — the `session` module should confirm this session is still valid
-- `brkpt-auth.verification.send` — whichever verification module matches should send a proof
-- `brkpt-auth.verification.verify` — whichever verification module matches should check a proof
+- `brkpt-auth.session.revoke` — the `session` feature should revoke this session
+- `brkpt-auth.session.revoke-others` — the `session` feature should revoke every other session
+- `brkpt-auth.session.validate` — the `session` feature should confirm this session is still valid
+- `brkpt-auth.verification.send` — whichever verification feature matches should send a proof
+- `brkpt-auth.verification.verify` — whichever verification feature matches should check a proof
 
 A command has a clear target and, usually, a single listener. The emitter knows exactly what it's asking for.
 

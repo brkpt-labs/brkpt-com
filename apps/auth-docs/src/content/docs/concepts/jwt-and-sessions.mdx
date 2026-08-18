@@ -172,9 +172,9 @@ async handleSessionRefresh({ sessionId, metadata }: SessionRefreshEvent) {
 
 ## Sessions, not token rotation
 
-Sessions are stored in a fast external store like Redis rather than the primary user table, for performance. Refresh tokens are not rotated.
+Sessions are stored in a fast external store like Redis, keyed with a TTL matching the session lifetime, rather than in the primary user table. Unlike designs where the refresh token itself is treated as the session credential, brkpt-auth does not rotate refresh tokens.
 
-This differs from both the classic server-side `@session` cookie model and the reissue-and-invalidate pattern used by many OAuth-based providers. A persistent session record is the source of truth: both tokens issued at sign-in carry nothing but a pointer to it (`sid`). The session record, not the token, is what gets revoked, inspected, and managed, directly by `sid`.
+This differs from both the classic server-side `@session` cookie model and the common pattern of treating the refresh token itself as the session credential. A persistent session record is the source of truth here: both tokens issued at sign-in carry nothing but a pointer to it (`sid`). The session record, not the token, is what gets revoked, inspected, and managed, directly by `sid`.
 
 Refresh token rotation limits the damage from a leaked refresh token: each refresh token can be used once, and using it issues a new one. Reusing an already-used token signals a leak and can trigger revoking the whole chain. The tradeoff: if a leaked token is reused before the legitimate client's next refresh, the system cannot tell attacker from owner, and whichever one refreshes second gets locked out. A grace period is usually added to tolerate concurrent refreshes and flaky networks, which introduces its own edge cases.
 

@@ -9,6 +9,11 @@ import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
 
 This guide continues from Get started and replaces the in-memory user repository with Prisma and PostgreSQL.
 
+<Aside type="tip">
+  This guide uses Prisma. If you use a different ORM, see [Use Drizzle](../../recipes/use-drizzle/) or [Use TypeORM](../../recipes/use-typeorm/) instead.
+</Aside>
+
+
 By the end of this guide, users created through `/auth/sign-up` will be stored in a persistent database instead of memory.
 
 ## Prerequisites

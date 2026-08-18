@@ -9,6 +9,10 @@ import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
 
 本指南承接开始使用，用 Prisma 和 PostgreSQL 替换内存用户 repository。
 
+<Aside type="tip">
+  本指南使用 Prisma。如果你使用其他 ORM，可以参考[使用 Drizzle](../../recipes/use-drizzle/)或[使用 TypeORM](../../recipes/use-typeorm/)。
+</Aside>
+
 完成本指南后，通过 `/auth/sign-up` 创建的用户会存储在持久化数据库中，而不是内存里。
 
 ## 前置条件

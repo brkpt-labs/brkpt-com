@@ -71,7 +71,7 @@ Inject a store for the attempt counter, and check it before validating the passw
      }
 
 +    const userId = this.port.extractUserIdFromUser(user);
-+    const key = `login-attempts:${userId}`;
++    const key = `login-attempts:${String(userId)}`;
 +    const attempts = Number((await this.redis.get(key)) ?? 0);
 +    if (attempts >= this.maxAttempts) {
 +      throw new UnauthorizedException(

@@ -13,13 +13,13 @@ brkpt-auth 使用事件发射器和监听器，让各个独立功能之间可以
 
 观察 brkpt-auth 的事件名会发现，根据命名空间那一段标识的对象不同，事件分为两类。
 
-**命令（Commands）**，命名空间指明了应该处理该事件的模块：
+**命令（Commands）**，命名空间指明了应该处理该事件的功能：
 
-- `brkpt-auth.session.revoke` — `session` 模块应该撤销这个会话
-- `brkpt-auth.session.revoke-others` — `session` 模块应该撤销除此之外的所有会话
-- `brkpt-auth.session.validate` — `session` 模块应该确认这个会话是否仍然有效
-- `brkpt-auth.verification.send` — 匹配到的验证模块应该发送一个凭证
-- `brkpt-auth.verification.verify` — 匹配到的验证模块应该校验一个凭证
+- `brkpt-auth.session.revoke` — `session` 功能应该撤销这个会话
+- `brkpt-auth.session.revoke-others` — `session` 功能应该撤销除此之外的所有会话
+- `brkpt-auth.session.validate` — `session` 功能应该确认这个会话是否仍然有效
+- `brkpt-auth.verification.send` — 匹配到的验证功能应该发送一个凭证
+- `brkpt-auth.verification.verify` — 匹配到的验证功能应该校验一个凭证
 
 命令有明确的目标，通常只有一个监听器。发射器清楚自己在请求什么。
 

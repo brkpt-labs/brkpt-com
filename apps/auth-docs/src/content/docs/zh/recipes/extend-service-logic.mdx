@@ -71,7 +71,7 @@ async signIn(dto: unknown, metadata?: RequestMetadata) {
      }
 
 +    const userId = this.port.extractUserIdFromUser(user);
-+    const key = `login-attempts:${userId}`;
++    const key = `login-attempts:${String(userId)}`;
 +    const attempts = Number((await this.redis.get(key)) ?? 0);
 +    if (attempts >= this.maxAttempts) {
 +      throw new UnauthorizedException(
