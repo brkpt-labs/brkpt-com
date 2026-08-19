@@ -5,6 +5,7 @@ import lucode from 'lucode-starlight';
 
 // https://astro.build/config
 export default defineConfig({
+  site: 'https://brkpt.com',
   base: '/cli',
   integrations: [
     starlight({
